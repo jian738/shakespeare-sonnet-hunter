@@ -1,0 +1,22 @@
+# Installed by cell 1 (pinned)
+nltk==3.9.1
+g2p_en==2.1.0
+PyWavelets==1.9.0
+
+# Preinstalled on Colab; versions from the second full run
+scikit-learn==1.6.1
+torch==2.11.0
+transformers==5.15.0
+
+# Unpinned basics
+numpy
+pandas
+scipy
+matplotlib
+seaborn
+requests
+tqdm
+
+# Repo tooling (local only)
+jupytext
+nbstripout

@@ -1,0 +1,19 @@
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Outputs the notebook writes when run (regenerate them, don't commit them)
+batch_output/
+batch_output_*.zip
+sonnet_candidates_*.txt
+sonnet_candidates_*.csv
+*.png
+*.svg
+!docs/**/*.png
+
+# OS / editor
+.DS_Store
+.vscode/settings.json
