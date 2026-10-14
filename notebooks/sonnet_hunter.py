@@ -2654,8 +2654,7 @@ def compare_cluster_word_structures(word_lists_dict):
             plt.show()
 
 
-# TODO (method 5): ARI between methods is chance-level; add silhouette scores or
-# bootstrap stability across k before interpreting these clusters.
+# See clustering_stability() below: silhouette vs a shuffled-word null, and bootstrap stability.
 def cluster_sonnets_by_rare_words(sonnets_map, n_clusters=6):
     """
     Run three clustering methods on rare-word usage:
@@ -2735,6 +2734,75 @@ else:
 
 
 # (The combined PCA that used df_temporal now runs in its own cell after the temporal analysis.)
+
+
+# --- Is there real cluster structure? (method 5) ---------------------------------
+# First run: ARI between K-Means, Ward and Spectral was -0.02 to 0.02 (chance level).
+# Two checks turn "the methods disagree" into a measured result:
+#   1. Silhouette vs k, compared with a NULL where each word's occurrences are shuffled
+#      across sonnets (keeps every word's frequency, destroys any co-occurrence pattern).
+#      Real structure = silhouette clearly above the null band.
+#   2. Bootstrap stability: refit on random 80% subsamples; ARI with the full-data
+#      clustering on the shared sonnets. Stable clusters ~ 0.6+; chance ~ 0.
+from sklearn.metrics import silhouette_score
+
+def _fit_labels(method, X, k, seed=0):
+    if method == "K-Means":
+        return KMeans(n_clusters=k, random_state=seed, n_init=10).fit_predict(X)
+    if method == "Agglomerative":
+        return AgglomerativeClustering(n_clusters=k, linkage="ward").fit_predict(X)
+    return SpectralClustering(n_clusters=k, affinity="nearest_neighbors",
+                              random_state=seed).fit_predict(X)
+
+def clustering_stability(sonnets_map, ks=range(2, 11), n_boot=20, n_null=20, seed=0):
+    sonnet_nums, rare_words, X = build_rare_word_matrix(sonnets_map, min_df=2, max_df=12)
+    Xb = X.astype(bool)
+    rng = np.random.default_rng(seed)
+    methods = ["K-Means", "Agglomerative", "Spectral"]
+    rows = []
+    for k in ks:
+        # null silhouettes (K-Means on column-shuffled data)
+        null_sil = []
+        for _ in range(n_null):
+            Xn = np.column_stack([rng.permutation(col) for col in X.T]).astype(np.float32)
+            null_sil.append(silhouette_score(Xn.astype(bool), _fit_labels("K-Means", Xn, k), metric="jaccard"))
+        for m in methods:
+            full = _fit_labels(m, X, k, seed)
+            sil = silhouette_score(Xb, full, metric="jaccard")
+            aris = []
+            for _ in range(n_boot):
+                sub = rng.choice(len(X), size=int(0.8 * len(X)), replace=False)
+                aris.append(adjusted_rand_score(full[sub], _fit_labels(m, X[sub], k, seed)))
+            rows.append({"k": k, "method": m, "silhouette": sil,
+                         "null_sil_mean": np.mean(null_sil), "null_sil_95": np.percentile(null_sil, 95),
+                         "stability_ARI": np.mean(aris)})
+    res = pd.DataFrame(rows)
+
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 4.5))
+    nul = res.groupby("k")[["null_sil_mean", "null_sil_95"]].first()
+    a1.fill_between(nul.index, nul["null_sil_mean"] - (nul["null_sil_95"] - nul["null_sil_mean"]),
+                    nul["null_sil_95"], color="grey", alpha=0.25, label="null (shuffled words)")
+    for m in methods:
+        r = res[res.method == m]
+        a1.plot(r.k, r.silhouette, "o-", label=m)
+        a2.plot(r.k, r.stability_ARI, "o-", label=m)
+    a1.set_title("Silhouette (Jaccard) vs k"); a1.set_xlabel("k"); a1.legend()
+    a2.axhline(0, color="grey", lw=1); a2.set_ylim(-0.1, 1)
+    a2.set_title("Bootstrap stability (ARI, 80% subsamples)"); a2.set_xlabel("k"); a2.legend()
+    plt.tight_layout(); plt.show()
+
+    print(res.round(3).to_string(index=False))
+    best = res.loc[res.stability_ARI.idxmax()]
+    beats_null = (res.silhouette > res.null_sil_95).any()
+    print(f"\nMost stable: {best.method} at k={int(best.k)} (ARI {best.stability_ARI:.2f}).")
+    print("Silhouette above the 95th percentile of the null for some k:", bool(beats_null))
+    if best.stability_ARI < 0.3 and not beats_null:
+        print("Verdict: no stable rare-word cluster structure. Report this as the result;")
+        print("the cluster word lists above should not be interpreted as themes.")
+    return res
+
+if 'sonnets_map' in locals():
+    stability_df = clustering_stability(sonnets_map)
 
 
 # %% [markdown] id="dn1gOmx2fd7V"
@@ -2928,22 +2996,29 @@ plt.show()
 plt.figure(figsize=(14, 8))
 power_smooth = gaussian_filter(power, sigma=(2, 2))
 
-# Significance Threshold (White Noise Model)
-# TODO (method 5): overlapping windows make this signal red noise; replace with an
-# AR(1) null spectrum (Torrence & Compo 1998) before trusting these contours.
+# Significance: AR(1) red-noise null by simulation (method 5).
+# The old white-noise threshold is drawn too (dashed) so you can see how much it over-calls.
 variance = np.var(sig)
-significance_threshold = variance * (stats.chi2.ppf(0.95, 2) / 2)
+significance_threshold = variance * (stats.chi2.ppf(0.95, 2) / 2)      # white noise (old)
+red_thr, ar1_alpha = ar1_wavelet_threshold(sig, scales, n_surr=30)
+sig_ratio = power_smooth / red_thr[:, None]                            # > 1 = significant vs red noise
+_inside = np.minimum(t, len(t) - 1 - t)[None, :] >= np.sqrt(2) * scales[:, None]
+print(f"Lag-1 autocorrelation of the score signal: {ar1_alpha:.2f}  (0 = white noise, near 1 = strongly red)")
+print(f"Share of the spectrum (inside the cone of influence) called significant: "
+      f"white-noise test {np.mean((power_smooth > significance_threshold)[_inside]):.1%}, "
+      f"red-noise test {np.mean((sig_ratio > 1)[_inside]):.1%}  (about 5% expected by chance)")
 
 levels = np.linspace(0, np.max(power), 20)
 CS = plt.contourf(t, periods, power_smooth, levels=levels, cmap='jet', extend='both')
 cbar = plt.colorbar(CS, label="Wavelet Power")
 
-plt.contour(t, periods, power_smooth, levels=[significance_threshold], colors='k', linewidths=1.5)
+plt.contour(t, periods, power_smooth, levels=[significance_threshold], colors='w', linewidths=1, linestyles='dashed')
+plt.contour(t, periods, sig_ratio, levels=[1.0], colors='k', linewidths=1.8)
 
 plt.fill_between(t, P_boundary, periods.max(), color='white', alpha=0.5, hatch='x', zorder=2)
 plt.plot(t, P_boundary, color='k', linewidth=2, zorder=3)
 
-plt.title(f"Wavelet Power Spectrum (Complex Morlet) with 95% Significance: {WORK_TO_ANALYZE}")
+plt.title(f"Wavelet Power Spectrum (Complex Morlet) \n95% significance: black = vs red noise (AR(1)), dashed white = vs white noise (old): {WORK_TO_ANALYZE}")
 plt.xlabel("Line Number")
 plt.ylabel("Period (Lines)")
 plt.yscale('log')
@@ -2983,8 +3058,6 @@ plt.show()
 print(f"\nTotal unique word types in {WORK_TO_ANALYZE}: {len(word_counts)}")
 
 # Test Groups
-# TODO (method 5): lines within one window aren't independent; use per-window rates or a
-# permutation test that shuffles whole windows instead of the t-test below.
 n_lines = len(clean_data)
 poetic_indices = set()
 for idx in top_indices:
@@ -3046,7 +3119,7 @@ def rare_counts_per_line(indices, freq_set):
     return counts_per_line
 
 freq_bins = {"1-use words": {1}, "1–2-use words": {1, 2}, "1–3-use words": {1, 2, 3}}
-print("\n=== T-TESTS: RARE WORD COUNTS PER LINE (POETIC vs NORMAL) ===")
+print("\n=== NAIVE T-TESTS (treat every line as independent; kept for comparison) ===")
 for label, fset in freq_bins.items():
     poetic_counts = rare_counts_per_line(poetic_indices_sorted, fset)
     normal_counts = rare_counts_per_line(normal_indices, fset)
@@ -3055,6 +3128,17 @@ for label, fset in freq_bins.items():
     print(f"  Poetic lines:  mean={np.mean(poetic_counts):.3f}, std={np.std(poetic_counts, ddof=1):.3f}, n={len(poetic_counts)}")
     print(f"  Normal lines:  mean={np.mean(normal_counts):.3f}, std={np.std(normal_counts, ddof=1):.3f}, n={len(normal_counts)}")
     print(f"  Welch t-test: t = {t_stat:.3f}, p = {p_val:.4g}")
+
+# --- Window-level permutation test (method 5) ---
+# Unit = window, not line. Null = the same number of randomly placed, non-overlapping
+# 14-line windows from this play. Compare its p-values with the naive t-tests above.
+print("\n=== WINDOW PERMUTATION TEST (unit = 14-line window) ===")
+_tok_per_line = np.array([len(tokenize(t_)) for t_, _ in clean_data], float)
+for label, fset in freq_bins.items():
+    _rare = np.array([sum(1 for w in tokenize(t_) if word_counts[w] in fset) for t_, _ in clean_data], float)
+    res = window_permutation_test(_rare, _tok_per_line, top_indices, size=14, n_perm=2000)
+    print(f"{label:>14}: top windows {res['observed']:.3%} rare tokens vs random windows "
+          f"{res['null_mean']:.3%} ± {res['null_sd']:.3%}  ->  p (two-sided) = {res['p_two_sided']:.3g}")
 
 # --- NEW: Score Distribution Histogram (Play vs All Sonnets) ---
 print("\nGenerating Score Distribution Comparison...")
@@ -3992,7 +4076,9 @@ for batch_idx, batch_titles in enumerate(batches):
 
         power_smooth = gaussian_filter(power, sigma=(2, 2))
         variance = np.var(sig)
-        significance_threshold = variance * (stats.chi2.ppf(0.95, 2) / 2)   # TODO (method 5): AR(1) red-noise null
+        # Red-noise (AR(1)) significance, 10 surrogates per play to keep the batch fast
+        red_thr, _alpha = ar1_wavelet_threshold(sig, scales, n_surr=10)
+        sig_ratio = power_smooth / red_thr[:, None]
 
         # COI
         d_to_edge = np.minimum(t, (len(t) - 1) - t).astype(float)
@@ -4004,7 +4090,7 @@ for batch_idx, batch_titles in enumerate(batches):
         levels = np.linspace(0, np.max(power), 20)
         CS = plt.contourf(t, periods, power_smooth, levels=levels, cmap='jet', extend='both')
         plt.colorbar(CS, label="Wavelet Power")
-        plt.contour(t, periods, power_smooth, levels=[significance_threshold], colors='k', linewidths=1.5)
+        plt.contour(t, periods, sig_ratio, levels=[1.0], colors='k', linewidths=1.5)
         plt.fill_between(t, P_boundary, periods.max(), color='white', alpha=0.5, hatch='x', zorder=2)
         plt.plot(t, P_boundary, color='k', linewidth=2, zorder=3)
 
@@ -4026,7 +4112,7 @@ for batch_idx, batch_titles in enumerate(batches):
             'power': power_smooth,
             'periods': periods,
             't': t,
-            'sig_thresh': significance_threshold,
+            'sig_ratio': sig_ratio,
             'P_boundary': P_boundary
         })
 
@@ -4144,7 +4230,7 @@ for batch_idx, batch_titles in enumerate(batches):
         # Use contourf
         ax.contourf(data['t'], data['periods'], data['power'], levels=levels, cmap='jet', extend='both')
         # Sig lines
-        ax.contour(data['t'], data['periods'], data['power'], levels=[data['sig_thresh']], colors='k', linewidths=1)
+        ax.contour(data['t'], data['periods'], data['sig_ratio'], levels=[1.0], colors='k', linewidths=1)
         # COI
         ax.fill_between(data['t'], data['P_boundary'], data['periods'].max(), color='white', alpha=0.5, hatch='x')
 
@@ -4170,7 +4256,7 @@ for batch_idx, batch_titles in enumerate(batches):
         ax = axes[i]
         levels = np.linspace(0, np.max(data['power']), 20)
         ax.contourf(data['t'], data['periods'], data['power'], levels=levels, cmap='jet', extend='both')
-        ax.contour(data['t'], data['periods'], data['power'], levels=[data['sig_thresh']], colors='k', linewidths=1)
+        ax.contour(data['t'], data['periods'], data['sig_ratio'], levels=[1.0], colors='k', linewidths=1)
         ax.fill_between(data['t'], data['P_boundary'], data['periods'].max(), color='white', alpha=0.5, hatch='x')
 
         ax.set_title(data['title'], fontsize=12)
@@ -4524,78 +4610,143 @@ if WORK_TO_ANALYZE == "THE SONNETS":
 # %% [markdown] id="JitvqpG2zcKg"
 # ## Semantic Coherence
 
+# %% [markdown]
+# ## Embedding Setup (sentence model, mean-pooled, centered)
+#
+
+# %%
+# Embedding setup (method 6) -- shared by Semantic Coherence and Distinctness
+# ------------------------------------------------------------------------------
+# First run: semantic distances were all 0.01-0.03 and coherence was near 1 for
+# everything. Two reasons:
+#   * raw [CLS] from un-fine-tuned BERT is not a sentence embedding;
+#   * transformer embeddings are "anisotropic": every vector points roughly the same
+#     way, so ANY two texts have cosine ~0.9+.
+# Fixes:
+#   * a model trained for sentence similarity, with mean-pooling over tokens
+#     (set EMBED_MODEL = "bert-base-uncased" to compare with plain BERT, also mean-pooled);
+#   * CENTERING: subtract the average embedding of a background sample of Shakespeare
+#     lines, so cosine measures how two texts differ from typical Shakespeare rather
+#     than from nothing. Centered cosines spread around 0.
+from transformers import AutoTokenizer, AutoModel
+
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+print(f"Loading {EMBED_MODEL} ...")
+emb_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL)
+emb_model = AutoModel.from_pretrained(EMBED_MODEL).eval()
+_EMB = {}
+
+def embed_texts(texts, batch_size=32):
+    """Mean-pooled token embeddings (attention-masked), cached per text. Shape (n, d)."""
+    todo = [t for t in dict.fromkeys(texts) if t not in _EMB]
+    for i in range(0, len(todo), batch_size):
+        chunk = todo[i:i + batch_size]
+        enc = emb_tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=256)
+        with torch.no_grad():
+            hid = emb_model(**enc).last_hidden_state
+        mask = enc["attention_mask"].unsqueeze(-1).float()
+        vecs = ((hid * mask).sum(1) / mask.sum(1).clamp(min=1)).numpy()
+        _EMB.update(zip(chunk, vecs))
+    return np.vstack([_EMB[t] for t in texts])
+
+# Background for centering: 2,000 random cleaned lines and 300 random 14-line passages
+_rng = np.random.default_rng(0)
+_bg_lines, _bg_passages = [], []
+for _t in [t for t in works if t not in NON_PLAY_TITLES]:
+    _cd = [x for x, _ in clean_play_lines(works[_t])[0]]
+    _bg_lines += [str(x) for x in _rng.choice(_cd, size=min(60, len(_cd)), replace=False)]
+    for _s in _rng.integers(0, max(1, len(_cd) - 14), size=8):
+        _bg_passages.append(" ".join(_cd[_s:_s + 14]))
+LINE_CENTER = embed_texts(_bg_lines[:2000]).mean(0)
+PASSAGE_CENTER = embed_texts(_bg_passages[:300]).mean(0)
+
+def centered_cos(A, B, center):
+    A = np.atleast_2d(A) - center; B = np.atleast_2d(B) - center
+    A /= np.linalg.norm(A, axis=1, keepdims=True) + 1e-9
+    B /= np.linalg.norm(B, axis=1, keepdims=True) + 1e-9
+    return A @ B.T
+
+_raw = cosine_similarity(embed_texts(_bg_lines[:200]))
+_cen = centered_cos(embed_texts(_bg_lines[:200]), embed_texts(_bg_lines[:200]), LINE_CENTER)
+_iu = np.triu_indices(200, 1)
+print(f"Random line pairs: raw cosine mean {_raw[_iu].mean():.2f}, centered cosine mean {_cen[_iu].mean():.2f}")
+print("(Centered values near 0 for unrelated lines are what we want.)")
+
+def known_and_random_windows(n_random=60, seed=1):
+    """Known play sonnets (from the evaluation cell) and random windows from the same plays,
+    as (title, start, size) tuples -- the validation set for both analyses below."""
+    rng = np.random.default_rng(seed)
+    known = [(r.play, int(r.line), int(min(r.n_lines, 18))) for r in known_df.itertuples()]
+    plays = sorted({k[0] for k in known})
+    rand = []
+    for _ in range(n_random):
+        t = plays[rng.integers(len(plays))]
+        n = len(clean_play_lines(works[t])[0])
+        rand.append((t, int(rng.integers(30, n - 50)), 14))
+    return known, rand
+
+
+
 # %% colab={"base_uri": "https://localhost:8080/", "height": 741, "referenced_widgets": ["55837779302e42369833b1e849992803", "6396bc35f260435ca33bb45460674f2d", "31b57a7d15574fa295315738abae0dbd", "66b35fcf363b4fd8b414fb7a6f4cb0cb", "4a31466fb5f4472999ae3864b08585d3", "7d70141aede84b7b8ca02a93582d985f", "3c5e533717da4937be9f61cc15cce8e2", "4c9946aa01944a4b86156636eb83a728", "9a508338c1b24869be2e9ea8afbb6b1a", "4e709d5bf8f94dd1afe03b28cf77465f", "98f21ccf42d44f3bb5dd0555921bf1ef", "a7239dd56f084e1b815f9009660637fe", "1cdd25cca3714211a3243dfbad500ee6", "e47c4a3467ea42f88f5f91f2ad7ab1bc", "d300ec992d1c4d1497caa54c803820dd", "543a324bb2fa4c1287e10f3e560b2179", "b367c4aa0b734aa3953b7b20eb8cdfe4", "23f6cd8070a5403b9bb97f5c3659e785", "e1e32a63444246c389161dc64d97f4c8", "2b5cb04bf3b142989ba5624dad49fea3", "8d54e074562b4a94a1ac2b186f5f46db", "265a8213cdd14fa4a4c357a7e107e0c8", "53828c2a65dc41dd8591b770f212ff06", "36aeb1ab3c9144b4ae6d2470a62872ab", "3ad8ac4d1bbf4abb86852787cf6f3d7c", "ce483632332443b586c2059c503610f8", "e37691833b134031b32fcd186c62ca02", "c14e41a37b384ceea91e865b57404d2b", "0f020b2d6a6e4956bf9a9bb36487641d", "a2c8f7e24cfb49ee8732382b85aed3e7", "d228e72148e14db28804e9ca3c712f36", "a3de63defe0947c0969e725f837a1115", "028d664ed20c4dc583a72d076c228c43", "b5a4746ed4f64dc1b7de6b52615015f7", "a2c30af2f4614430803cacc9740002e4", "9eb2134518d94c2ea366eb7046fb852e", "f8d40c7750114efaba6fd9903d023fcb", "e7ba9bb0036c4c49ac65bcb2773a2b0b", "5b449f420fe94c999e34435fe8f18fa1", "68e413e7c51d4a5d9f4d3966ebb4f0c0", "6f4099529f4545e08939363ac4c3d29f", "b6b0f9ba75394c01b5a056677d682379", "c7bdae967e954533aa84dfa23833bc1f", "a5f5c09859224111b1e4adf787aa4282", "31d145ac91c14fdca67a0672446e26f7", "3e7071a8ad264306808e343e5ae490e9", "652d28dfc08841549d1b2160a85457e5", "8d8dc4c8266f434786a5282f2c7840a1", "7f8de6a818e14a119c5871d893dbd22d", "0597afedb752493db2ff29a431df02c1", "ed36cf72904a4d77ae23879064e51d0b", "38f426f13b1540c584e5a580251d8cb6", "a6ff011c7664473787ab71da64cde0d4", "2d7841e854f14ae2a42450b1703ded06", "3da784ff27e248198d0e70ae053a0c56"]} id="7ottDuO1zMLt" outputId="4f245c99-b20f-4be9-97a4-53f9bd4b011f"
-# Semantic Coherence
+# Semantic Coherence (method 6 applied)
+# Coherence of a passage = mean CENTERED cosine similarity between its lines
+# (sentence-embedding model, mean-pooled; see the setup cell above).
 
 # --- CONFIGURATION ---
-# Works to analyze for semantic coherence
 COHERENCE_WORKS = ["A MIDSUMMER NIGHT’S DREAM", "TROILUS AND CRESSIDA"]
 TOP_N_CANDIDATES = 25
 # ---------------------
 
-# 1. Load BERT
-print("Loading BERT Model...")
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-model = BertModel.from_pretrained('bert-base-uncased')
-print("BERT Loaded.")
-
-model.eval()
-_EMB_CACHE = {}
-
-def embed_lines(lines, batch_size=64):
-    """[CLS] embeddings for many lines in batched forward passes, cached per line.
-    TODO (method 6): mean-pool or use a sentence-embedding model; raw [CLS] is weak."""
-    todo = [l for l in dict.fromkeys(lines) if l not in _EMB_CACHE]
-    for i in range(0, len(todo), batch_size):
-        chunk = todo[i:i + batch_size]
-        inputs = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=128)
-        with torch.no_grad():
-            out = model(**inputs).last_hidden_state[:, 0, :].numpy()
-        _EMB_CACHE.update(zip(chunk, out))
-    return np.vstack([_EMB_CACHE[l] for l in lines]) if lines else np.zeros((0, 768))
-
 def score_semantic_coherence(lines):
     lines = [l for l in lines if l.strip()]
-    if len(lines) < 2: return 0.0
-    embeddings = embed_lines(lines)
-    sim_matrix = cosine_similarity(embeddings)
-    upper_tri = sim_matrix[np.triu_indices(len(sim_matrix), k=1)]
-    return np.mean(upper_tri)
+    if len(lines) < 2:
+        return 0.0
+    S = centered_cos(embed_texts(lines), embed_texts(lines), LINE_CENTER)
+    return float(S[np.triu_indices(len(lines), k=1)].mean())
 
-# 2. Gather Data & Score
-coherence_data = []
+def window_text_lines(title, start, size):
+    cd = clean_play_lines(works[title])[0]
+    return [t for t, _ in cd[start:start + size]]
 
-# A. The Sonnets (Baseline)
+# 0. VALIDATION FIRST: does coherence separate the known play sonnets from random windows?
+known_w, random_w = known_and_random_windows()
+coh_known = [score_semantic_coherence(window_text_lines(*w)) for w in known_w]
+coh_rand = [score_semantic_coherence(window_text_lines(*w)) for w in random_w]
+u = stats.mannwhitneyu(coh_known, coh_rand, alternative="two-sided")
+print(f"Validation: known play sonnets coherence {np.median(coh_known):.3f} (median, n={len(coh_known)}) "
+      f"vs random play windows {np.median(coh_rand):.3f} (n={len(coh_rand)});  Mann-Whitney p = {u.pvalue:.3g}")
+if u.pvalue > 0.05:
+    print("-> Coherence does NOT distinguish known sonnets from ordinary dialogue here;"
+          " differences below should not be read as evidence.")
+
+# 1. Gather data
+coherence_data = [{"Work": "Known play sonnets", "Type": "Validation", "Coherence": c} for c in coh_known] + \
+                 [{"Work": "Random play windows", "Type": "Validation", "Coherence": c} for c in coh_rand]
+
 sonnets_map_bert = parse_sonnets_map(works)
-
 print("Scoring 'THE SONNETS'...")
-for i in range(1, 21): # Sample first 20 for speed/viz
-    if i in sonnets_map_bert:
-        coh = score_semantic_coherence(sonnets_map_bert[i][:14])
-        coherence_data.append({"Work": "THE SONNETS", "Type": "Real Sonnet", "Coherence": coh})
+for num in sorted(sonnets_map_bert)[:40]:
+    coherence_data.append({"Work": "THE SONNETS", "Type": "Real Sonnet",
+                           "Coherence": score_semantic_coherence(sonnets_map_bert[num][:14])})
 
-# B. Comparison Works
 for title in COHERENCE_WORKS:
     print(f"Scoring '{title}'...")
     scores, clean, _ = analyze_work(title, works[title])
-    top_indices = nms_top_k(scores, k=TOP_N_CANDIDATES)     # bug 11: no near-duplicate windows
+    for idx in nms_top_k(scores, k=TOP_N_CANDIDATES):
+        coherence_data.append({"Work": title, "Type": "Candidate",
+                               "Coherence": score_semantic_coherence(window_lines(clean, idx))})
 
-    for idx in top_indices:
-        lines = window_lines(clean, idx)                        # clipped at the end of the play
-        coh = score_semantic_coherence(lines)
-        coherence_data.append({"Work": title, "Type": "Candidate", "Coherence": coh})
-
-# 3. Visualization
-import pandas as pd
+# 2. Visualization
 df_coh = pd.DataFrame(coherence_data)
-
-plt.figure(figsize=(10, 6))
-sns.boxplot(x="Work", y="Coherence", data=df_coh, palette="Set2")
+plt.figure(figsize=(12, 6))
+sns.boxplot(x="Work", y="Coherence", data=df_coh, hue="Work", palette="Set2", legend=False)
 sns.stripplot(x="Work", y="Coherence", data=df_coh, color=".25", alpha=0.5)
-plt.title("Semantic Coherence: Real Sonnets vs. Play Candidates")
-plt.ylabel("Cosine Similarity (Coherence)")
-plt.grid(axis='y', alpha=0.3)
-plt.show()
+plt.axhline(0, color="grey", lw=1)
+plt.title("Semantic coherence (centered cosine between lines)")
+plt.ylabel("Mean centered cosine"); plt.xticks(rotation=15)
+plt.grid(axis="y", alpha=0.3); plt.tight_layout(); plt.show()
+print(df_coh.groupby("Work")["Coherence"].describe().round(3))
+
 
 # %% [markdown] id="M50HJ5AXzVb0"
 # ## Style & Authorship
@@ -4654,13 +4805,12 @@ plt.show()
 # %% [markdown] id="B28jpAmoz-sQ"
 # ## Distinctness
 
-# %% colab={"base_uri": "https://localhost:8080/"} id="v4XGMmPppKEp" outputId="9d4c27a7-5360-449d-a5f3-45a96c329ae2"
-# !ls -lh ~/.cache/huggingface/hub
-# !find ~/.cache/huggingface -maxdepth 3 -type f -name "model.safetensors" -ls
-
-
 # %% colab={"base_uri": "https://localhost:8080/", "height": 1000} id="L0brMAW90C3-" outputId="b38f86b4-c693-4d68-d9de-25ee94dde167"
-# Distinctness
+# Distinctness (method 6 applied)
+# Is a candidate passage different from the 14 lines before and after it?
+#   Semantic distance = 1 - mean centered cosine(candidate, before), (candidate, after),
+#                       each embedded as a WHOLE passage (not an average of line vectors).
+#   Stylistic distance = Jaccard distance between word sets (unchanged).
 
 # --- CONFIGURATION ---
 DISTINCTNESS_WORKS = [
@@ -4669,154 +4819,62 @@ DISTINCTNESS_WORKS = [
     "THE TRAGEDY OF HAMLET, PRINCE OF DENMARK"
 ]
 TOP_N_DISTINCT = 10
-EMBED_DIM = 768  # bert-base-uncased hidden size
+CONTEXT = 14
 # ---------------------
 
-
-# --- BERT / EMBEDDING SETUP ---
-# Only load BERT if not already present (prevents double-loading if you ran another cell earlier)
-if "bert_tokenizer" not in globals() or "bert_model" not in globals():
-    print("Loading BERT model for distinctness analysis...")
-    bert_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-    bert_model = BertModel.from_pretrained("bert-base-uncased")
-    bert_model.eval()
-    print("BERT loaded.")
-
-def get_line_embedding(line: str) -> np.ndarray:
-    """
-    Returns a (1, EMBED_DIM) numpy array for a single line of text,
-    using the [CLS] token embedding from bert-base-uncased.
-    """
-    inputs = bert_tokenizer(
-        line,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=128
-    )
-    with torch.no_grad():
-        outputs = bert_model(**inputs)
-    # CLS token embedding
-    cls_emb = outputs.last_hidden_state[:, 0, :]  # shape (1, EMBED_DIM)
-    return cls_emb.numpy()
-
-
-# --- DISTINCTNESS HELPERS ---
-_DIST_EMB_CACHE = {}
-
-def embed_lines_batched(lines, batch_size=64):
-    """Batched, cached version of get_line_embedding."""
-    todo = [l for l in dict.fromkeys(lines) if l not in _DIST_EMB_CACHE]
-    for i in range(0, len(todo), batch_size):
-        chunk = todo[i:i + batch_size]
-        inputs = bert_tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=128)
-        with torch.no_grad():
-            out = bert_model(**inputs).last_hidden_state[:, 0, :].numpy()
-        _DIST_EMB_CACHE.update(zip(chunk, out))
-    return np.vstack([_DIST_EMB_CACHE[l] for l in lines])
-
-# TODO (method 6): raw [CLS] from un-fine-tuned BERT gives cosine ~1 for everything;
-# mean-pool or use a sentence-embedding model, and validate on the 22 known sonnets.
-def get_text_centroid(lines):
-    """Centroid of the lines' BERT embeddings, shape (1, EMBED_DIM)."""
-    lines = [l for l in lines if l.strip()]
-    if not lines:
-        return np.zeros((1, EMBED_DIM))
-    return np.mean(embed_lines_batched(lines), axis=0, keepdims=True)
-
+def passage_distinctness(clean_data, idx, size=14):
+    cand = [t for t, _ in clean_data[idx: idx + size]]
+    pre = [t for t, _ in clean_data[max(0, idx - CONTEXT): idx]]
+    post = [t for t, _ in clean_data[idx + size: idx + size + CONTEXT]]
+    if not cand or not (pre or post):
+        return None
+    ctx = [" ".join(p) for p in (pre, post) if p]
+    sims = centered_cos(embed_texts([" ".join(cand)]), embed_texts(ctx), PASSAGE_CENTER)[0]
+    cw = set(w.lower() for t in cand for w in tokenize_words(t))
+    xw = set(w.lower() for t in pre + post for w in tokenize_words(t))
+    style = 1 - len(cw & xw) / max(1, len(cw | xw))
+    return {"Semantic_Dist": float(1 - sims.mean()), "Style_Dist": style, "Snippet": cand[0]}
 
 def analyze_contextual_distinctness(work_title, top_n=5):
-    """
-    For a given work:
-      - Uses 'analyze_work' to get candidate scores & clean lines
-      - Picks top_n non-overlapping candidates (NMS-style)
-      - Measures semantic and stylistic distance vs. surrounding context
-    """
     print(f"\nAnalyzing Contextual Distinctness for: {work_title}")
-
-    # 'works' and 'analyze_work' must be defined elsewhere in your notebook
     scores, clean_data, _ = analyze_work(work_title, works[work_title])
-    scores_array = np.array(scores)
-
-    top_indices = nms_top_k(scores, k=top_n)      # shared NMS
-
     results = []
-    for rank, idx in enumerate(top_indices):
-        candidate_lines = [x[0] for x in clean_data[idx : idx + 14]]
-        pre_context = [x[0] for x in clean_data[max(0, idx - 14) : idx]]
-        post_context = [x[0] for x in clean_data[idx + 14 : min(len(clean_data), idx + 28)]]
-        context_lines = pre_context + post_context
-
-        if not context_lines:
-            continue
-
-        # Semantic Distance (BERT centroid cosine distance)
-        cand_vec = get_text_centroid(candidate_lines)   # (1, EMBED_DIM)
-        cont_vec = get_text_centroid(context_lines)     # (1, EMBED_DIM)
-        sem_dist = 1.0 - cosine_similarity(cand_vec, cont_vec)[0][0]
-
-        # Stylistic Distance (Jaccard distance over word sets)
-        cand_words = set(" ".join(candidate_lines).lower().split())
-        cont_words = set(" ".join(context_lines).lower().split())
-        inter = len(cand_words.intersection(cont_words))
-        union = len(cand_words.union(cont_words))
-        style_dist = 1.0 - (inter / union if union > 0 else 0)
-
-        results.append({
-            "Rank":          rank + 1,
-            "Score":         scores[idx],
-            "Semantic_Dist": sem_dist,
-            "Style_Dist":    style_dist,
-            "Snippet":       candidate_lines[0]
-        })
-
+    for rank, idx in enumerate(nms_top_k(scores, k=top_n)):
+        r = passage_distinctness(clean_data, idx)
+        if r:
+            results.append({"Rank": rank + 1, "Score": scores[idx], **r})
     return results
 
+# VALIDATION FIRST: are the known play sonnets more distinct from their context
+# than random windows are from theirs?
+known_w, random_w = known_and_random_windows()
+def _dist(w):
+    t, s, n = w
+    return passage_distinctness(clean_play_lines(works[t])[0], s, n)
+dk = [d for d in map(_dist, known_w) if d]; dr = [d for d in map(_dist, random_w) if d]
+for key in ("Semantic_Dist", "Style_Dist"):
+    a, b = [d[key] for d in dk], [d[key] for d in dr]
+    p = stats.mannwhitneyu(a, b, alternative="two-sided").pvalue
+    print(f"Validation {key}: known sonnets median {np.median(a):.3f} vs random windows "
+          f"{np.median(b):.3f}  (Mann-Whitney p = {p:.3g})")
+print("If p > 0.05, this measure can't tell a known sonnet from ordinary dialogue,"
+      " so it can't confirm new candidates either.")
 
-# --- RUN ANALYSIS ---
 all_results = []
 for title in DISTINCTNESS_WORKS:
-    res = analyze_contextual_distinctness(title, top_n=TOP_N_DISTINCT)
-    for r in res:
+    for r in analyze_contextual_distinctness(title, top_n=TOP_N_DISTINCT):
         r["Work"] = title
         all_results.append(r)
-
-# --- VISUALIZATION ---
+for d in dk:
+    all_results.append({**d, "Work": "Known play sonnets", "Rank": 0, "Score": np.nan})
 df_dist = pd.DataFrame(all_results)
 
 plt.figure(figsize=(10, 8))
-sns.scatterplot(
-    data=df_dist,
-    x="Semantic_Dist",
-    y="Style_Dist",
-    hue="Work",
-    style="Work",
-    s=150,
-    palette="viridis"
-)
-
-# Add labels with rank numbers
-for i in range(df_dist.shape[0]):
-    plt.text(
-        df_dist.Semantic_Dist[i] + 0.0005,
-        df_dist.Style_Dist[i],
-        f"#{df_dist.Rank[i]}",
-        fontsize=9,
-        alpha=0.7
-    )
-
-plt.title("Contextual Distinctness: Semantic vs. Stylistic Distance")
-plt.xlabel("Semantic Distance (Meaning Shift)")
-plt.ylabel("Stylistic Distance (Vocab Shift)")
-plt.legend(loc="lower right")
-#plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-plt.show()
-
-# Table Output
-print("\nDetailed Distinctness Data:")
-print(df_dist[["Work", "Rank", "Score", "Semantic_Dist", "Style_Dist", "Snippet"]].to_string(index=False))
+sns.scatterplot(data=df_dist, x="Semantic_Dist", y="Style_Dist", hue="Work", style="Work", s=120, palette="viridis")
+plt.title("Contextual distinctness (centered sentence embeddings)")
+plt.xlabel("Semantic distance from surrounding lines"); plt.ylabel("Vocabulary (Jaccard) distance")
+plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()
+print(df_dist[["Work", "Rank", "Score", "Semantic_Dist", "Style_Dist", "Snippet"]].round(3).to_string(index=False))
 
 
 # %% colab={"base_uri": "https://localhost:8080/"} id="TdVCIWkPXWbq" outputId="85f28177-92ad-4cd2-b6fb-0005731f4887"
@@ -4846,7 +4904,7 @@ sns.scatterplot(
 # Add labels with rank numbers
 for i in range(df_dist.shape[0]):
     plt.text(
-        df_dist.Semantic_Dist[i] + 0.0005,
+        df_dist.Semantic_Dist[i] + 0.002,
         df_dist.Style_Dist[i],
         f"#{df_dist.Rank[i]}",
         fontsize=7,
