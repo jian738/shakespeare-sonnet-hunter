@@ -1,6 +1,6 @@
 # Second full run (version 6)
 
-Saved text output from the Colab run of notebook version 6. Figures are not included; rerun the notebook to see them.
+Saved output from the Colab run of notebook version 6: key printed text and every figure.
 
 ## Cell 6: classifier training
 
@@ -50,6 +50,10 @@ Saved CSV: sonnet_candidates_structured.csv
 
 --- Generating Visualizations ---
 ```
+
+**Figure 1.** Supervised scores for play windows vs held-out canonical sonnets (left); top-2% candidates across the corpus (right)
+
+![Supervised scores for play windows vs held-out canonical sonnets (left); top-2% candidates across the corpus (right)](run-2-figures/01-classifier-scores.png)
 
 ## Cell 8b: evaluation on the known play sonnets
 
@@ -122,6 +126,64 @@ Tuned weights (chosen on the tune half): {'meter': np.float64(0.0), 'syllable': 
   test: recall@50 0.60 -> 0.60; median rank 40 -> 44
 If the TEST numbers improve, copy the tuned weights into WEIGHTS in cell 4 and re-run.
 ```
+
+## Cell 9: THE SONNETS analysis
+
+**Figure 2.** Rule-detector signal along THE SONNETS
+
+![Rule-detector signal along THE SONNETS](run-2-figures/02-sonnets-signal.png)
+
+**Figure 3.** Scores of the 154 canonical sonnets and the 22 known play sonnets
+
+![Scores of the 154 canonical sonnets and the 22 known play sonnets](run-2-figures/03-sonnets-and-play-sonnets-scores.png)
+
+**Figure 4.** Sonnets ranked by score, marked by rhyme-scheme deviation
+
+![Sonnets ranked by score, marked by rhyme-scheme deviation](run-2-figures/04-sonnets-ranked-rhyme-deviations.png)
+
+**Figure 5.** How often each word is used in the Sonnets
+
+![How often each word is used in the Sonnets](run-2-figures/05-sonnets-vocabulary-histogram.png)
+
+**Figure 6.** Sonnets clustered by rare-word usage: K-Means
+
+![Sonnets clustered by rare-word usage: K-Means](run-2-figures/06-clusters-kmeans.png)
+
+**Figure 7.** Sonnets clustered by rare-word usage: Agglomerative (Ward)
+
+![Sonnets clustered by rare-word usage: Agglomerative (Ward)](run-2-figures/07-clusters-ward.png)
+
+**Figure 8.** Ward dendrogram of the sonnets
+
+![Ward dendrogram of the sonnets](run-2-figures/08-dendrogram-ward.png)
+
+**Figure 9.** Sonnets clustered by rare-word usage: Spectral
+
+![Sonnets clustered by rare-word usage: Spectral](run-2-figures/09-clusters-spectral.png)
+
+**Figure 10.** Cluster overlap by sonnets: K-Means vs Ward
+
+![Cluster overlap by sonnets: K-Means vs Ward](run-2-figures/10-overlap-kmeans-vs-ward.png)
+
+**Figure 11.** Cluster overlap by sonnets: K-Means vs Spectral
+
+![Cluster overlap by sonnets: K-Means vs Spectral](run-2-figures/11-overlap-kmeans-vs-spectral.png)
+
+**Figure 12.** Jaccard of cluster word sets: K-Means vs Ward
+
+![Jaccard of cluster word sets: K-Means vs Ward](run-2-figures/12-jaccard-kmeans-vs-ward.png)
+
+**Figure 13.** Jaccard of cluster word sets: K-Means vs Spectral
+
+![Jaccard of cluster word sets: K-Means vs Spectral](run-2-figures/13-jaccard-kmeans-vs-spectral.png)
+
+**Figure 14.** Jaccard of cluster word sets: Ward vs Spectral
+
+![Jaccard of cluster word sets: Ward vs Spectral](run-2-figures/14-jaccard-ward-vs-spectral.png)
+
+**Figure 15.** Silhouette vs k against the shuffled-word null (left); bootstrap stability (right)
+
+![Silhouette vs k against the shuffled-word null (left); bootstrap stability (right)](run-2-figures/15-cluster-stability.png)
 
 ## Cell 10: Midsummer (top hits, statistics)
 
@@ -518,6 +580,60 @@ Generating Score Distribution Comparison...
 Generating Word Usage Comparison Chart...
 ```
 
+**Figure 16.** Detection signal in A Midsummer Night's Dream, with classifier overlay and top hits
+
+![Detection signal in A Midsummer Night's Dream, with classifier overlay and top hits](run-2-figures/16-midsummer-signal.png)
+
+**Figure 17.** Wavelet power spectrum of the Midsummer signal
+
+![Wavelet power spectrum of the Midsummer signal](run-2-figures/17-midsummer-wavelet-power.png)
+
+**Figure 18.** Wavelet power with significance contours
+
+![Wavelet power with significance contours](run-2-figures/18-midsummer-wavelet-significance.png)
+
+**Figure 19.** How often each word is used in Midsummer
+
+![How often each word is used in Midsummer](run-2-figures/19-midsummer-vocabulary-histogram.png)
+
+**Figure 20.** Score distribution: Midsummer windows vs all sonnets
+
+![Score distribution: Midsummer windows vs all sonnets](run-2-figures/20-midsummer-vs-sonnets-score-kde.png)
+
+**Figure 21.** Fraction of word types by frequency: Sonnets vs Midsummer
+
+![Fraction of word types by frequency: Sonnets vs Midsummer](run-2-figures/21-midsummer-word-usage.png)
+
+## Temporal analysis
+
+**Figure 22.** Sonnets on PC1 vs PC2, coloured by composition date
+
+![Sonnets on PC1 vs PC2, coloured by composition date](run-2-figures/22-temporal-pca-pc1-pc2.png)
+
+**Figure 23.** Feature loadings for PC1 and PC2
+
+![Feature loadings for PC1 and PC2](run-2-figures/23-temporal-loadings-pc1-pc2.png)
+
+**Figure 24.** Sonnets on PC3 vs PC4, coloured by composition date
+
+![Sonnets on PC3 vs PC4, coloured by composition date](run-2-figures/24-temporal-pca-pc3-pc4.png)
+
+**Figure 25.** Feature loadings for PC3 and PC4
+
+![Feature loadings for PC3 and PC4](run-2-figures/25-temporal-loadings-pc3-pc4.png)
+
+## Combined PCA
+
+**Figure 26.** Combined PCA: temporal metrics, LSA themes and rare-word Ward clusters
+
+![Combined PCA: temporal metrics, LSA themes and rare-word Ward clusters](run-2-figures/26-combined-pca.png)
+
+## Word-usage chart
+
+**Figure 27.** Fraction of word types by frequency: Sonnets and three plays
+
+![Fraction of word types by frequency: Sonnets and three plays](run-2-figures/27-word-usage-four-works.png)
+
 ## Sonnet Finder V2 (neural mode)
 
 ```text
@@ -620,6 +736,14 @@ How much salt water thrown away in waste,
 To 
 ```
 
+**Figure 28.** Neural-mode detection signal in Romeo and Juliet
+
+![Neural-mode detection signal in Romeo and Juliet](run-2-figures/28-romeo-juliet-neural-signal.png)
+
+**Figure 29.** Neural-mode score distributions: Sonnets vs three plays
+
+![Neural-mode score distributions: Sonnets vs three plays](run-2-figures/29-neural-score-distributions.png)
+
 ## Semantic coherence (validation)
 
 ```text
@@ -646,6 +770,16 @@ Random play windows        0.139
 THE SONNETS                0.138  
 TROILUS AND CRESSIDA       0.116
 ```
+
+**Figure 30.** Semantic coherence by group
+
+![Semantic coherence by group](run-2-figures/30-coherence.png)
+
+## Stylometry
+
+**Figure 31.** Stylometry: PCA of top-100-word counts
+
+![Stylometry: PCA of top-100-word counts](run-2-figures/31-stylometry-pca.png)
 
 ## Distinctness (validation)
 
@@ -695,3 +829,13 @@ THE TRAGEDY OF HAMLET, PRINCE OF DENMARK     9  0.629          0.944       0.879
 THE TRAGEDY OF HAMLET, PRINCE OF DENMARK    10  0.629          0.874       0.856              That have a father kill’d, a mother stain’d,
         
 ```
+
+**Figure 32.** Contextual distinctness of the top 10 candidates per play
+
+![Contextual distinctness of the top 10 candidates per play](run-2-figures/32-distinctness-top10.png)
+
+## Distinctness, top 20
+
+**Figure 33.** Contextual distinctness of the top 20 candidates per play
+
+![Contextual distinctness of the top 20 candidates per play](run-2-figures/33-distinctness-top20.png)

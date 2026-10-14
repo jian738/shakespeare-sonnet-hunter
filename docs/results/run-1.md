@@ -1,6 +1,6 @@
 # First full run (version 5)
 
-Saved text output from the Colab run of notebook version 5. Figures are not included; rerun the notebook to see them.
+Saved output from the Colab run of notebook version 5: key printed text and every figure.
 
 ## Cell 6: classifier training
 
@@ -52,6 +52,10 @@ Saved CSV: sonnet_candidates_structured.csv
 /usr/local/lib/python3.13/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Creating legend with loc="best" can be slow with large amounts of data.
   fig.canvas.print_figure(bytes_io, **kw)
 ```
+
+**Figure 1.** Supervised scores for play windows vs held-out canonical sonnets (left); top-2% candidates across the corpus (right)
+
+![Supervised scores for play windows vs held-out canonical sonnets (left); top-2% candidates across the corpus (right)](run-1-figures/01-classifier-scores.png)
 
 ## Cell 8b: evaluation on the known play sonnets
 
@@ -108,6 +112,60 @@ Tuned weights (chosen on the tune half): {'meter': np.float64(0.4), 'syllable': 
   test: recall@50 0.62 -> 0.62; median rank 28 -> 28
 If the TEST numbers improve, copy the tuned weights into WEIGHTS in cell 4 and re-run.
 ```
+
+## Cell 9: THE SONNETS analysis
+
+**Figure 2.** Rule-detector signal along THE SONNETS
+
+![Rule-detector signal along THE SONNETS](run-1-figures/02-sonnets-signal.png)
+
+**Figure 3.** Scores of the 154 canonical sonnets and the 22 known play sonnets
+
+![Scores of the 154 canonical sonnets and the 22 known play sonnets](run-1-figures/03-sonnets-and-play-sonnets-scores.png)
+
+**Figure 4.** Sonnets ranked by score, marked by rhyme-scheme deviation
+
+![Sonnets ranked by score, marked by rhyme-scheme deviation](run-1-figures/04-sonnets-ranked-rhyme-deviations.png)
+
+**Figure 5.** How often each word is used in the Sonnets
+
+![How often each word is used in the Sonnets](run-1-figures/05-sonnets-vocabulary-histogram.png)
+
+**Figure 6.** Sonnets clustered by rare-word usage: K-Means
+
+![Sonnets clustered by rare-word usage: K-Means](run-1-figures/06-clusters-kmeans.png)
+
+**Figure 7.** Sonnets clustered by rare-word usage: Agglomerative (Ward)
+
+![Sonnets clustered by rare-word usage: Agglomerative (Ward)](run-1-figures/07-clusters-ward.png)
+
+**Figure 8.** Ward dendrogram of the sonnets
+
+![Ward dendrogram of the sonnets](run-1-figures/08-dendrogram-ward.png)
+
+**Figure 9.** Sonnets clustered by rare-word usage: Spectral
+
+![Sonnets clustered by rare-word usage: Spectral](run-1-figures/09-clusters-spectral.png)
+
+**Figure 10.** Cluster overlap by sonnets: K-Means vs Ward
+
+![Cluster overlap by sonnets: K-Means vs Ward](run-1-figures/10-overlap-kmeans-vs-ward.png)
+
+**Figure 11.** Cluster overlap by sonnets: K-Means vs Spectral
+
+![Cluster overlap by sonnets: K-Means vs Spectral](run-1-figures/11-overlap-kmeans-vs-spectral.png)
+
+**Figure 12.** Jaccard of cluster word sets: K-Means vs Ward
+
+![Jaccard of cluster word sets: K-Means vs Ward](run-1-figures/12-jaccard-kmeans-vs-ward.png)
+
+**Figure 13.** Jaccard of cluster word sets: K-Means vs Spectral
+
+![Jaccard of cluster word sets: K-Means vs Spectral](run-1-figures/13-jaccard-kmeans-vs-spectral.png)
+
+**Figure 14.** Jaccard of cluster word sets: Ward vs Spectral
+
+![Jaccard of cluster word sets: Ward vs Spectral](run-1-figures/14-jaccard-ward-vs-spectral.png)
 
 ## Cell 10: Midsummer (top hits, statistics)
 
@@ -497,6 +555,60 @@ Generating Score Distribution Comparison...
 Generating Word Usage Comparison Chart...
 ```
 
+**Figure 15.** Detection signal in A Midsummer Night's Dream, with classifier overlay and top hits
+
+![Detection signal in A Midsummer Night's Dream, with classifier overlay and top hits](run-1-figures/15-midsummer-signal.png)
+
+**Figure 16.** Wavelet power spectrum of the Midsummer signal
+
+![Wavelet power spectrum of the Midsummer signal](run-1-figures/16-midsummer-wavelet-power.png)
+
+**Figure 17.** Wavelet power with significance contours
+
+![Wavelet power with significance contours](run-1-figures/17-midsummer-wavelet-significance.png)
+
+**Figure 18.** How often each word is used in Midsummer
+
+![How often each word is used in Midsummer](run-1-figures/18-midsummer-vocabulary-histogram.png)
+
+**Figure 19.** Score distribution: Midsummer windows vs all sonnets
+
+![Score distribution: Midsummer windows vs all sonnets](run-1-figures/19-midsummer-vs-sonnets-score-kde.png)
+
+**Figure 20.** Fraction of word types by frequency: Sonnets vs Midsummer
+
+![Fraction of word types by frequency: Sonnets vs Midsummer](run-1-figures/20-midsummer-word-usage.png)
+
+## Temporal analysis
+
+**Figure 21.** Sonnets on PC1 vs PC2, coloured by composition date
+
+![Sonnets on PC1 vs PC2, coloured by composition date](run-1-figures/21-temporal-pca-pc1-pc2.png)
+
+**Figure 22.** Feature loadings for PC1 and PC2
+
+![Feature loadings for PC1 and PC2](run-1-figures/22-temporal-loadings-pc1-pc2.png)
+
+**Figure 23.** Sonnets on PC3 vs PC4, coloured by composition date
+
+![Sonnets on PC3 vs PC4, coloured by composition date](run-1-figures/23-temporal-pca-pc3-pc4.png)
+
+**Figure 24.** Feature loadings for PC3 and PC4
+
+![Feature loadings for PC3 and PC4](run-1-figures/24-temporal-loadings-pc3-pc4.png)
+
+## Combined PCA
+
+**Figure 25.** Combined PCA: temporal metrics, LSA themes and rare-word Ward clusters
+
+![Combined PCA: temporal metrics, LSA themes and rare-word Ward clusters](run-1-figures/25-combined-pca.png)
+
+## Word-usage chart
+
+**Figure 26.** Fraction of word types by frequency: Sonnets and three plays
+
+![Fraction of word types by frequency: Sonnets and three plays](run-1-figures/26-word-usage-four-works.png)
+
 ## Sonnet Finder V2 (neural mode)
 
 ```text
@@ -598,3 +710,120 @@ Hath wash’d thy sallow cheeks for Rosaline!
 How much salt water thrown away in waste,
 To sea
 ```
+
+**Figure 27.** Neural-mode detection signal in Romeo and Juliet
+
+![Neural-mode detection signal in Romeo and Juliet](run-1-figures/27-romeo-juliet-neural-signal.png)
+
+**Figure 28.** Neural-mode score distributions: Sonnets vs three plays
+
+![Neural-mode score distributions: Sonnets vs three plays](run-1-figures/28-neural-score-distributions.png)
+
+## Semantic coherence
+
+```text
+Loading BERT Model...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+WARNING:huggingface_hub.utils._http:Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Key                                        | Status     |  | 
+-------------------------------------------+------------+--+-
+cls.predictions.bias                       | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.weight | UNEXPECTED |  | 
+cls.predictions.transform.dense.weight     | UNEXPECTED |  | 
+cls.seq_relationship.weight                | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.bias   | UNEXPECTED |  | 
+cls.seq_relationship.bias                  | UNEXPECTED |  | 
+cls.predictions.transform.dense.bias       | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+BERT Loaded.
+Scoring 'THE SONNETS'...
+Scoring 'A MIDSUMMER NIGHT’S DREAM'...
+Analyzing A MIDSUMMER NIGHT’S DREAM...
+Scoring 'TROILUS AND CRESSIDA'...
+Analyzing TROILUS AND CRESSIDA...
+/tmp/ipykernel_3719/660258789.py:66: FutureWarning: 
+
+Passing `palette` without assigning `hue` is deprecated and will be removed in v0.14.0. Assign the `x` variable to `hue` and set `legend=False` for the same effect.
+
+  sns.boxplot(x="Work", y="Coherence", data=df_coh, palette="Set2")
+```
+
+**Figure 29.** Semantic coherence by group
+
+![Semantic coherence by group](run-1-figures/29-coherence.png)
+
+## Stylometry
+
+**Figure 30.** Stylometry: PCA of top-100-word counts
+
+![Stylometry: PCA of top-100-word counts](run-1-figures/30-stylometry-pca.png)
+
+## Distinctness
+
+```text
+Loading BERT model for distinctness analysis...
+Key                                        | Status     |  | 
+-------------------------------------------+------------+--+-
+cls.predictions.bias                       | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.weight | UNEXPECTED |  | 
+cls.predictions.transform.dense.weight     | UNEXPECTED |  | 
+cls.seq_relationship.weight                | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.bias   | UNEXPECTED |  | 
+cls.seq_relationship.bias                  | UNEXPECTED |  | 
+cls.predictions.transform.dense.bias       | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+BERT loaded.
+
+Analyzing Contextual Distinctness for: THE TRAGEDY OF ROMEO AND JULIET
+Analyzing THE TRAGEDY OF ROMEO AND JULIET...
+
+Analyzing Contextual Distinctness for: A MIDSUMMER NIGHT’S DREAM
+Analyzing A MIDSUMMER NIGHT’S DREAM...
+
+Analyzing Contextual Distinctness for: THE TRAGEDY OF HAMLET, PRINCE OF DENMARK
+Analyzing THE TRAGEDY OF HAMLET, PRINCE OF DENMARK...
+
+Detailed Distinctness Data:
+                                    Work  Rank    Score  Semantic_Dist  Style_Dist                                                   Snippet
+         THE TRAGEDY OF ROMEO AND JULIET     1 0.953750       0.024828    0.904040                  Now old desire doth in his deathbed lie,
+         THE TRAGEDY OF ROMEO AND JULIET     2 0.901667       0.042355    0.924242                    Two households, both alike in dignity,
+         THE TRAGEDY OF ROMEO AND JULIET     3 0.879750       0.028890    0.886139            Good pilgrim, you do wrong your hand too much,
+         THE TRAGEDY OF ROMEO AND JULIET     4 0.826071       0.010576    0.889401         Sleep dwell upon thine eyes, peace in thy breast.
+         THE TRAGEDY OF ROMEO AND JULIET     5 0.825536       0.010581    0.868421                At my poor house look to behold this night
+         THE TRAGEDY OF ROMEO AND JULIET     6 0.781364       0.011561    0.904545           This precious book of love, this unbound lover,
+         THE TRAGEDY OF ROMEO AND JULIET     7 0.777250       0.013136    0.868687             O, she doth teach the torches to burn bright!
+         THE TRAGEDY OF ROMEO AND JULIET     8 0.766000       0.015539    0.892857            For naught so vile that on the earth doth live
+         THE TRAGEDY OF ROMEO AND JULIET     9 0.765375       0.015327    0.901408                      When the devout religion of mine eye
+         THE TRAGEDY OF ROMEO AND JULIET    10 0.754318       0.012266    0.889952                           At thy good heart’s oppression.
+               A MIDSUMMER NIGHT’S DREAM     1 0.887679       0.011008    0.900000                            Now the wasted brands do glow,
+               A MIDSUMMER NIGHT’S DREAM     2 0.882000       0.011036    0.823232                 And as she fled, her mantle she did fall;
+               A MIDSUMMER NIGHT’S DREAM     3 0.835714       0.017686    0.859903                   So sorrow’s heaviness doth heavier grow
+               A MIDSUMMER NIGHT’S DREAM     4 0.835714       0.014092    0.906863         Dark night, that from the eye his function takes,
+               A MIDSUMMER NIGHT’S DREAM     5 0.831071       0.015046    0.881517               Take comfort: he no more shall see my face;
+               A MIDSUMMER NIGHT’S DREAM     6 0.826488       0.015025    0.849246          Fair love, you faint with wand’ring in the wood.
+               A MIDSUMMER NIGHT’S DREAM     7 0.825536       0.010748    0.882883               I had rather give his carcass to my hounds.
+               A MIDSUMMER NIGHT’S DREAM     8 0.818036       0.014267    0.882075          Love looks not with the eyes, but with the mind;
+               A MIDSUMMER NIGHT’S DREAM     9 0.807202       0.007816    0.861386                      Crystal is muddy. O how ripe in show
+               A MIDSUMMER NIGHT’S DREAM    10 0.804875       0.023373    0.863415                   If we offend, it is with our good will.
+THE TRAGEDY OF HAMLET, PRINCE OF DENMARK     1 0.831429       0.018341    0.911765                    That our devices still are overthrown.
+THE TRAGEDY OF HAMLET, PRINCE OF DENMARK     2 0.719643       0.017189    0.884058                  But, woe is me, you are so sick of late,
+THE TRAGEDY OF HAMLET, PRINCE OF DENMARK     3 0.705000       0.023195    0.877551                   The instances that second marriage move
+THE TRAGEDY OF HAMLET, PRINCE OF DENMARK     4 0.664250       0.011717    0.867647                  Or in th’incestuous pleasure of his bed,
+THE TRAGEDY OF HAMLET, PRINCE OF DENMARK     5 0.645114       0.010310    0.859729         And from his mother’s closet hath he dragg’d him.
+THE TRAGEDY OF HAMLET, PRINCE OF DENMARK     6 0.632743       0.012671    0.873239                     Of habits evil, is angel yet in this,
+THE TRAGEDY OF HAMLET, PRINCE OF DENMARK     7 0.632216       0.013
+```
+
+**Figure 31.** Contextual distinctness of the top 10 candidates per play
+
+![Contextual distinctness of the top 10 candidates per play](run-1-figures/31-distinctness-top10.png)
+
+## Distinctness, top 20
+
+**Figure 32.** Contextual distinctness of the top 20 candidates per play
+
+![Contextual distinctness of the top 20 candidates per play](run-1-figures/32-distinctness-top20.png)
