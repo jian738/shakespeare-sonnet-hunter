@@ -602,6 +602,11 @@ for line in works["PLAY SONNETS"]:
 WEIGHTS = {"meter": 0.25, "syllable": 0.15, "rhyme": 0.35, "couplet": 0.25}
 COMPONENTS = ("meter", "syllable", "rhyme", "couplet")
 WINDOW_SIZES = (10, 11, 14, 15, 18)
+# Rhyme credit for a body that is not exactly three quatrains. Two quatrains + couplet
+# (10 lines, ABAB CDCD EE) is a real form: 6 of the 22 known play sonnets have 10 lines.
+# The second run ranked several of them low (Much Ado 3.1 at 951). The evaluation cell
+# compares 0.75 with 1.0 on the known sonnets; change this only if the TEST half improves.
+SHORT_FORM_CREDIT = 0.75
 NMS_RADIUS = max(WINDOW_SIZES)          # suppress hits closer than one window
 
 # ---------- 1. Tokenising (bug 2) --------------------------------------------
@@ -773,7 +778,7 @@ def line_features(line, mode="cmu"):
 # ---------- 4. Rhyme (bug 1, method 4) ---------------------------------------
 _HISTORICAL_GROUPS = [
     ["love", "move", "prove", "remove", "approve", "reprove"],
-    ["gone", "alone", "moan", "one", "none", "done", "shown", "own", "upon", "on"],
+    ["gone", "foregone", "begone", "alone", "moan", "bemoan", "one", "none", "done", "shown", "own", "upon", "on"],
     ["forth", "worth"],
     ["wind", "mind", "kind", "find", "behind", "blind"],
     ["come", "doom", "tomb", "home", "roam"],
@@ -788,6 +793,11 @@ HISTORICAL_RHYMES = defaultdict(set)
 for group in _HISTORICAL_GROUPS:
     for a in group:
         HISTORICAL_RHYMES[a].update(g for g in group if g != a)
+
+# Same stressed vowel, different final consonants (moan/o'er). Slightly below 0.5 so that
+# scheme LABELS (check_rhyme, min_level 0.5) skip it: the second run labelled Sonnet 30
+# "ABBA" because foregone/before and o'er/moan matched on vowels alone.
+SLANT_LEVEL = 0.45
 
 def _strip(phones):
     return tuple(re.sub(r"\d", "", ph) for ph in phones)
@@ -810,6 +820,25 @@ def _final_syllable_parts(prons):
         if idx is not None:
             parts.add(_strip(p[idx:]))
     return parts
+
+_REDUCED = {"AH0", "IH0", "ER0", "UH0"}
+
+def _final_vowel_and_coda(prons):
+    out = set()
+    for p in prons:
+        idx = next((i for i in range(len(p) - 1, -1, -1) if p[i][-1].isdigit()), None)
+        if idx is not None and idx < len(p) - 1:          # needs a final consonant
+            out.add((p[idx], tuple(p[idx + 1:])))
+    return out
+
+def _reduced_final_match(p1, p2):
+    """Final syllables share their consonants and at least one vowel is a reduced schwa:
+    CMU writes 'ornament' with AH0 where Shakespeare's rhyme with 'content' is audible."""
+    for v1, c1 in _final_vowel_and_coda(p1):
+        for v2, c2 in _final_vowel_and_coda(p2):
+            if c1 == c2 and (v1 in _REDUCED or v2 in _REDUCED):
+                return True
+    return False
 
 def _n_syll(prons):
     return sum(ph[-1].isdigit() for ph in prons[0])
@@ -838,11 +867,13 @@ def rhyme_level(w1, w2, mode="cmu"):
             return 1.0
         if max(_n_syll(p1), _n_syll(p2)) > 1 and _final_syllable_parts(p1) & _final_syllable_parts(p2):
             return 0.5
+        if max(_n_syll(p1), _n_syll(p2)) > 1 and _reduced_final_match(p1, p2):
+            return 0.5        # ornament/content: same final consonants, one vowel reduced by CMU
         ay1 = any(r[0] == "AY" for r in r1); ay2 = any(r[0] == "AY" for r in r2)
         if (ay1 and w2.endswith("y") and _n_syll(p2) > 1) or (ay2 and w1.endswith("y") and _n_syll(p1) > 1):
             return 0.5
         v1 = {r[0] for r in r1 if r}; v2 = {r[0] for r in r2 if r}
-        return 0.5 if v1 & v2 else 0.0
+        return SLANT_LEVEL if v1 & v2 else 0.0
     # unknown word: only a 3-letter spelling match, and only as a weak rhyme
     if len(w1) >= 3 and len(w2) >= 3 and w1[-3:] == w2[-3:] and re.search(r"[aeiouy]", w1[-3:]):
         return 0.5
@@ -866,6 +897,13 @@ def quatrain_score(w, mode="cmu"):
                                    rhyme_level(w[b[0]], w[b[1]], mode)))
     return best
 
+def _shape_credit(nq, rem):
+    if nq == 3 and rem == 0:
+        return 1.0
+    if nq == 2 and rem == 0:
+        return SHORT_FORM_CREDIT
+    return 0.75
+
 def window_parts(lines, mode="cmu"):
     """Component scores (meter, syllable, rhyme, couplet) for one window, each 0-1."""
     if len(lines) < 8:
@@ -877,7 +915,7 @@ def window_parts(lines, mode="cmu"):
     body = ends[:-2]
     nq, rem = divmod(len(body), 4)
     q = [quatrain_score(body[i:i + 4], mode) for i in range(0, nq * 4, 4)]
-    rhyme = (np.mean(q) if q else 0.0) * (1.0 if (nq == 3 and rem == 0) else 0.75)
+    rhyme = (np.mean(q) if q else 0.0) * _shape_credit(nq, rem)
     couplet = rhyme_level(ends[-2], ends[-1], mode)
     return np.array([meter, syll, rhyme, couplet])
 
@@ -906,7 +944,7 @@ def clean_play_lines(lines):
     clean_data, boundaries = [], []
     speaker = "UNKNOWN"
     in_direction = False                      # inside a [ ... ] that spans several lines
-    for raw in lines:
+    for li, raw in enumerate(lines):
         s = raw.strip()
         if not s:
             continue
@@ -937,7 +975,13 @@ def clean_play_lines(lines):
         # and keep whatever verse follows it.
         s = _INLINE_DIRECTION_RE.sub("", s)
         if "[" in s:                          # an opening bracket with no close on this line
-            s, in_direction = s.split("[", 1)[0], True
+            # Second run: an unclosed "[" could swallow verse until the next "]" anywhere
+            # below. Only treat it as a multi-line direction if "]" appears within 4 lines;
+            # otherwise it's a stray bracket: drop the character, keep the text.
+            if any("]" in nxt for nxt in lines[li + 1: li + 5]):
+                s, in_direction = s.split("[", 1)[0], True
+            else:
+                s = s.replace("[", "")
         s = s.replace("_", "").strip()
         if not s or s.isupper() or _NUMBER_RE.match(s):   # titles, sonnet numbers, empty
             continue
@@ -958,7 +1002,7 @@ def scan_work(title, lines, mode="cmu", window_sizes=WINDOW_SIZES, use_cache=Tru
       clean_data, boundaries, window_sizes
     Re-weighting later is a dot product, so tuning WEIGHTS never needs a re-scan.
     """
-    key = (title, mode, tuple(window_sizes))
+    key = (title, mode, tuple(window_sizes), SHORT_FORM_CREDIT)
     if use_cache and key in SCAN_CACHE:
         return SCAN_CACHE[key]
     clean_data, boundaries = clean_play_lines(lines)
@@ -975,7 +1019,7 @@ def scan_work(title, lines, mode="cmu", window_sizes=WINDOW_SIZES, use_cache=Tru
         if w < 8 or w > n:
             continue
         nq, rem = divmod(w - 2, 4)
-        mult = 1.0 if (nq == 3 and rem == 0) else 0.75
+        mult = _shape_credit(nq, rem)
         starts = np.arange(0, n - w + 1)
         parts[starts, k, 0] = (cm[starts + w] - cm[starts]) / w
         parts[starts, k, 1] = (cs[starts + w] - cs[starts]) / w
@@ -1156,6 +1200,52 @@ def window_permutation_test(values_per_line, weights_per_line, starts, size=14,
             "p_two_sided": (1 + np.sum(np.abs(null - mu) >= abs(obs - mu))) / (1 + n_perm),
             "p_greater": (1 + np.sum(null >= obs)) / (1 + n_perm)}
 
+def phase_wavelet_threshold(sig, scales, wavelet="cmor1.5-1.0", smooth_sigma=(2, 2),
+                            n_surr=30, q=0.95, seed=0):
+    """
+    Second run: the AR(1) null still called 46% of Midsummer's spectrum significant.
+    AR(1) has a short memory, but a max-over-18-line-windows signal stays correlated for
+    ~18 lines, so AR(1) underestimates its long-period power.
+
+    Phase-randomized surrogates keep the signal's OWN average power spectrum and scramble
+    only the phases (Theiler et al. 1992). Anything significant against them is power that
+    is LOCALIZED in time (a burst at one place in the play), not a property of the whole
+    signal -- which is what "a sonnet-rich passage here" would look like.
+    Returns threshold per scale (95th percentile inside the cone of influence).
+    """
+    sig = np.asarray(sig, float) - np.mean(sig)
+    n = len(sig)
+    amp = np.abs(np.fft.rfft(sig))
+    rng = np.random.default_rng(seed)
+    pooled = []
+    for _ in range(n_surr):
+        ph = rng.uniform(0, 2 * np.pi, len(amp)); ph[0] = 0
+        if n % 2 == 0: ph[-1] = 0
+        x = np.fft.irfft(amp * np.exp(1j * ph), n)
+        c, _ = pywt.cwt(x, scales, wavelet, method="fft")
+        pooled.append(gaussian_filter(np.abs(c) ** 2, sigma=smooth_sigma))
+    pooled = np.stack(pooled)
+    t = np.arange(n); edge = np.minimum(t, n - 1 - t)
+    thr = np.empty(len(scales))
+    for k, sc in enumerate(scales):
+        inside = edge >= np.sqrt(2) * sc
+        vals = pooled[:, k, inside] if inside.sum() >= 10 else pooled[:, k, :]
+        thr[k] = np.quantile(vals, q)
+    return thr
+
+def show_raw(phrase, before=3, after=6):
+    """Print the RAW Gutenberg lines around a phrase, exactly as the cleaner receives them.
+    Use it when a known sonnet is 'not in the corpus' or a speaker label looks wrong."""
+    key = re.sub(r"[^a-z0-9]", "", phrase.lower())[:25]
+    raw = full_text.split("\n")
+    hits = [i for i, l in enumerate(raw) if key and key in re.sub(r"[^a-z0-9]", "", l.lower())]
+    if not hits:
+        print(f"'{phrase}' not found in the raw text"); return
+    for i in hits[:3]:
+        print(f"--- raw lines {i - before}..{i + after} ---")
+        for j in range(max(0, i - before), min(len(raw), i + after + 1)):
+            print(f"{j:7d} | {raw[j]!r}")
+
 print("Shared toolkit ready:", WEIGHTS)
 
 
@@ -1272,9 +1362,11 @@ for use_tfidf in (False, True):
     auc_sup[use_tfidf] = roc_auc_score(y_sup, p)
     print(f"  structural{' + TF-IDF' if use_tfidf else ' only'}: AUC = {auc_sup[use_tfidf]:.3f}")
 
-# Keep TF-IDF only if it adds real held-out signal after cleaning (method 2).
-# Override by setting USE_TFIDF = True/False yourself.
-USE_TFIDF = None
+# Second run: the auto-switch turned TF-IDF on (+0.017 AUC), the Friar Laurence blank
+# verse jumped back to 0.69, and recall@50 stayed at 0.05. AUC rewards vocabulary
+# (sonnet topics), not form, so it is the wrong criterion for this switch.
+# Default: structural features only. Set None to restore the AUC-based switch.
+USE_TFIDF = False
 if USE_TFIDF is None:
     USE_TFIDF = (auc_sup[True] - auc_sup[False]) >= 0.01
 print(f"  -> USE_TFIDF = {USE_TFIDF}")
@@ -1719,6 +1811,69 @@ for name, r in rank_table.items():
     per_sonnet[name] = r
 print("\nRank of each known sonnet (lower is better; inf = never in the hit list):")
 print(per_sonnet.to_string(index=False))
+
+# --- Why was each missed sonnet missed? ------------------------------------
+# A known sonnet can be missed because it scores low, or because a stronger peak within
+# NMS_RADIUS lines suppressed it (second run: LLL 4.3.57 was missed by the rule detector
+# but ranked 21st by the supervised classifier).
+def explain_misses(score_by_play, ranks, name, top=50):
+    print(f"\n{name}: known sonnets outside the top {top}")
+    for (_, row), r in zip(known_df.iterrows(), ranks):
+        if r <= top:
+            continue
+        sc = np.asarray(score_by_play[row["play"]]); i = int(row["line"])
+        lo, hi = max(0, i - NMS_RADIUS), min(len(sc), i + NMS_RADIUS)
+        j = lo + int(np.argmax(sc[lo:hi]))
+        pct = 100 * np.mean(np.concatenate(list(score_by_play.values())) < sc[i])
+        why = (f"suppressed by a stronger peak {j - i:+d} lines away ({sc[j]:.3f})"
+               if j != i and sc[j] > sc[i] else "scores too low on its own")
+        print(f"  {row['label'][:40]:40s} score {sc[i]:.3f} (top {100 - pct:.2f}% of windows); {why}")
+
+explain_misses(rule_scores(), rank_table["rule (WEIGHTS)"], "rule (WEIGHTS)")
+
+# --- Combine rule detector and PU classifier (reciprocal rank fusion) -------
+# The two detectors miss different sonnets, so a combined ranking may beat both.
+# RRF: score = 1/(60 + rank_rule) + 1/(60 + rank_pu), ranks over every window in every play.
+def global_ranks(score_by_play):
+    allv = np.concatenate([np.asarray(v) for v in score_by_play.values()])
+    order = (-allv).argsort(kind="stable")
+    rk = np.empty(len(allv)); rk[order] = np.arange(1, len(allv) + 1)
+    out, k = {}, 0
+    for t, v in score_by_play.items():
+        out[t] = rk[k:k + len(v)]; k += len(v)
+    return out
+
+_rr, _rp = global_ranks(rule_scores()), global_ranks(classifier_scores("pu"))
+fused = {t: 1 / (60 + _rr[t]) + 1 / (60 + _rp[t]) for t in play_titles}
+rank_table["rule + PU (fused)"] = known_ranks(ranked_hits(fused), known_df)
+for split in ("tune", "test"):
+    row, _ = evaluate(fused, known_df[known_df["split"] == split], "rule + PU (fused)")
+    print(f"rule + PU (fused), {split}: recall@50 {row['recall@50']:.2f}, median rank {row['median_rank']:.0f}")
+(rl, rh), (ml, mh) = bootstrap_ci(rank_table["rule + PU (fused)"])
+print(f"  all {len(known_df)}: recall@50 = {np.mean(rank_table['rule + PU (fused)'] <= 50):.2f} [{rl:.2f}, {rh:.2f}]")
+
+# --- Does full credit for 10-line forms help? -------------------------------
+# 6 of the 22 known sonnets have 10 lines (ABAB CDCD EE), but a two-quatrain body only
+# gets SHORT_FORM_CREDIT (0.75) of the rhyme score. Rescan with 1.0 and compare on TEST.
+RUN_SHORT_FORM_CHECK = True     # rescans every play once (~1-2 min)
+if RUN_SHORT_FORM_CHECK:
+    _saved = SHORT_FORM_CREDIT
+    for credit in (0.75, 1.0):
+        SHORT_FORM_CREDIT = credit
+        sbp = {t: scores_from_scan(scan_work(t, works[t]))[0] for t in play_titles}
+        for split in ("tune", "test"):
+            row, _ = evaluate(sbp, known_df[known_df["split"] == split], f"credit {credit}")
+            print(f"  SHORT_FORM_CREDIT = {credit:.2f}, {split}: recall@50 {row['recall@50']:.2f}, "
+                  f"median rank {row['median_rank']:.0f}")
+    SHORT_FORM_CREDIT = _saved
+    print("Change SHORT_FORM_CREDIT in cell 4 only if the TEST half improves.")
+
+# Diagnose sonnets that still cannot be located (raw Gutenberg text around the first line)
+for lab in missing:
+    spec = next(s_ for s_ in play_sonnet_specs if s_["label"] == lab)
+    first = manual_play_sonnets[lab][0] if lab in manual_play_sonnets else spec["first_line"]
+    print(f"\nRaw text near the first line of {lab}:")
+    show_raw(first)
 
 # --- 3. Tune rule weights on the TUNE half only, report on TEST -------------
 def tune_weights(step=0.1, metric="recall@50"):
@@ -2793,10 +2948,13 @@ def clustering_stability(sonnets_map, ks=range(2, 11), n_boot=20, n_null=20, see
 
     print(res.round(3).to_string(index=False))
     best = res.loc[res.stability_ARI.idxmax()]
-    beats_null = (res.silhouette > res.null_sil_95).any()
+    # Second run: silhouettes of 0.000-0.003 counted as "above the null" because the
+    # null's 95th percentile was itself negative. Require real separation too.
+    beats_null = ((res.silhouette > res.null_sil_95) & (res.silhouette > 0.05)).any()
     print(f"\nMost stable: {best.method} at k={int(best.k)} (ARI {best.stability_ARI:.2f}).")
-    print("Silhouette above the 95th percentile of the null for some k:", bool(beats_null))
-    if best.stability_ARI < 0.3 and not beats_null:
+    print("Silhouette above the null AND above 0.05 for some k:", bool(beats_null))
+    print(f"Highest silhouette: {res.silhouette.max():.3f} (0 = no separation; 0.25+ = weak structure)")
+    if best.stability_ARI < 0.5 and not beats_null:
         print("Verdict: no stable rare-word cluster structure. Report this as the result;")
         print("the cluster word lists above should not be interpreted as themes.")
     return res
@@ -3001,12 +3159,16 @@ power_smooth = gaussian_filter(power, sigma=(2, 2))
 variance = np.var(sig)
 significance_threshold = variance * (stats.chi2.ppf(0.95, 2) / 2)      # white noise (old)
 red_thr, ar1_alpha = ar1_wavelet_threshold(sig, scales, n_surr=30)
-sig_ratio = power_smooth / red_thr[:, None]                            # > 1 = significant vs red noise
+ph_thr = phase_wavelet_threshold(sig, scales, n_surr=30)              # keeps the signal's own spectrum
+sig_ratio = power_smooth / ph_thr[:, None]                             # > 1 = LOCALIZED power beyond chance
 _inside = np.minimum(t, len(t) - 1 - t)[None, :] >= np.sqrt(2) * scales[:, None]
 print(f"Lag-1 autocorrelation of the score signal: {ar1_alpha:.2f}  (0 = white noise, near 1 = strongly red)")
 print(f"Share of the spectrum (inside the cone of influence) called significant: "
       f"white-noise test {np.mean((power_smooth > significance_threshold)[_inside]):.1%}, "
-      f"red-noise test {np.mean((sig_ratio > 1)[_inside]):.1%}  (about 5% expected by chance)")
+      f"AR(1) red-noise test {np.mean((power_smooth > red_thr[:, None])[_inside]):.1%}, "
+      f"phase-randomized test {np.mean((sig_ratio > 1)[_inside]):.1%}  (about 5% expected by chance)")
+print("Significant under the phase-randomized test = power concentrated at one place in the play,"
+      " not just a red-noise signal.")
 
 levels = np.linspace(0, np.max(power), 20)
 CS = plt.contourf(t, periods, power_smooth, levels=levels, cmap='jet', extend='both')
@@ -3018,7 +3180,7 @@ plt.contour(t, periods, sig_ratio, levels=[1.0], colors='k', linewidths=1.8)
 plt.fill_between(t, P_boundary, periods.max(), color='white', alpha=0.5, hatch='x', zorder=2)
 plt.plot(t, P_boundary, color='k', linewidth=2, zorder=3)
 
-plt.title(f"Wavelet Power Spectrum (Complex Morlet) \n95% significance: black = vs red noise (AR(1)), dashed white = vs white noise (old): {WORK_TO_ANALYZE}")
+plt.title(f"Wavelet Power Spectrum (Complex Morlet) \n95% significance: black = vs phase-randomized surrogates, dashed white = vs white noise (old): {WORK_TO_ANALYZE}")
 plt.xlabel("Line Number")
 plt.ylabel("Period (Lines)")
 plt.yscale('log')
@@ -4077,8 +4239,8 @@ for batch_idx, batch_titles in enumerate(batches):
         power_smooth = gaussian_filter(power, sigma=(2, 2))
         variance = np.var(sig)
         # Red-noise (AR(1)) significance, 10 surrogates per play to keep the batch fast
-        red_thr, _alpha = ar1_wavelet_threshold(sig, scales, n_surr=10)
-        sig_ratio = power_smooth / red_thr[:, None]
+        ph_thr = phase_wavelet_threshold(sig, scales, n_surr=10)
+        sig_ratio = power_smooth / ph_thr[:, None]   # localized power vs phase-randomized surrogates
 
         # COI
         d_to_edge = np.minimum(t, (len(t) - 1) - t).astype(float)

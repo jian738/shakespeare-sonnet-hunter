@@ -1,5 +1,20 @@
 # Changelog
 
+## v7 — fixes from the second run
+
+Why: the second run showed TF-IDF returning by an AUC-based switch (Friar Laurence 0.06 -> 0.69),
+a too-lenient clustering verdict, label errors, and an AR(1) null that still flagged 46% of the spectrum.
+
+- TF-IDF off by default (`USE_TFIDF = False`).
+- Clustering verdict needs silhouette > 0.05 and stability ARI >= 0.5.
+- Slant rhymes score 0.45 so scheme labels skip them; foregone/begone/bemoan added to historical rhymes.
+- Reduced-vowel final syllables count as weak rhymes (ornament/content).
+- `show_raw()` prints raw Gutenberg lines for unlocated sonnets; unclosed `[` only skips if `]` is within 4 lines.
+- `explain_misses()`: low score vs NMS suppression for each missed sonnet.
+- `SHORT_FORM_CREDIT` setting and a 0.75 vs 1.0 comparison for 10-line sonnets.
+- Fused ranking (rule + PU, reciprocal rank fusion) evaluated like any detector.
+- Wavelet significance vs phase-randomized surrogates (localized power).
+
 ## v6 — fixes from the first run, dependent-data statistics
 
 Why: the first run located only 15 of 22 known sonnets (a cleaner bug), and several
