@@ -16,11 +16,9 @@
 
 # %% colab={"base_uri": "https://localhost:8080/"} id="dbemM8Hk1mGX" outputId="8c995180-cd9d-4d2c-d3a5-e435cd1f82ee"
 # Cell 1: Setup and Imports
-# !pip install nltk
-# !pip install g2p_en transformers torch scikit-learn
-# !pip install --upgrade pip
-# !pip cache purge
-# !pip install PyWavelets
+# Pinned versions (the ones this notebook last ran with). torch, transformers and
+# scikit-learn come pre-installed on Colab; their versions are printed below.
+# !pip install -q nltk==3.9.1 g2p_en==2.1.0 PyWavelets==1.9.0
 import os
 import re
 import csv
@@ -55,8 +53,8 @@ from scipy.cluster.hierarchy import linkage, dendrogram
 from sklearn.decomposition import TruncatedSVD, PCA
 from sklearn.feature_extraction.text import CountVectorizer, TfidfTransformer, TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import adjusted_rand_score
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_predict
+from sklearn.metrics import adjusted_rand_score, roc_auc_score
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -65,7 +63,10 @@ nltk.download('cmudict')
 nltk.download('punkt')
 nltk.download('averaged_perceptron_tagger_eng')
 from nltk.corpus import cmudict
-from google.colab import files
+try:
+    from google.colab import files
+except ImportError:
+    files = None   # running outside Colab
 
 try:
     from tqdm.auto import tqdm
@@ -76,6 +77,10 @@ except ImportError:
 
 # Initialize CMU Dict
 d = cmudict.dict()
+
+import sklearn, transformers
+print(f"numpy {np.__version__} | pandas {pd.__version__} | sklearn {sklearn.__version__} | "
+      f"torch {torch.__version__} | transformers {transformers.__version__} | nltk {nltk.__version__}")
 
 
 # %% [markdown] id="OHkQozkb9dNa"
@@ -574,65 +579,584 @@ for line in works["PLAY SONNETS"]:
 
 
 # %% [markdown] id="QFPLUxK3fVI6"
-# ## Prepare Natural Language Processing Tools
+# ## Shared Toolkit: text cleaning, syllables, stress, rhyme, one scorer
+#
 
 # %% colab={"base_uri": "https://localhost:8080/"} id="YhmLesjY1m9l" outputId="1efb992e-80c0-4f06-adf2-2721407048a8"
-# Cell 4: NLP Tools (Syllables, Stress, Rhyme)
-def count_syllables(word):
-    word = word.lower().strip(".,;:!?()[]\"'")
-    if not word: return 0
-    if word in d:
-        return [len(list(y for y in x if y[-1].isdigit())) for x in d[word]][0]
+# Cell 4: Shared Sonnet Toolkit (single source of truth)
+# -----------------------------------------------------------------------------
+# Every later cell imports its text handling and scoring from HERE, so the
+# detectors, classifiers, scans and plots all see the same lines, the same
+# tokens and the same weights. (Before this cell existed, count_syllables,
+# get_stress_pattern, analyze_work, the line filter and the weights each had
+# 2-4 slightly different copies, which is where several bugs came from.)
+# -----------------------------------------------------------------------------
+
+# ---------- 0. Configuration -------------------------------------------------
+# One set of weights used by EVERY rule-based detector (bug 3).
+# These are the weights your docstring documents.
+# First full run (Oct 13): tune_weights() on the 7 tune-half sonnets chose
+# meter 0.4 / syllable 0 / rhyme 0.3 / couplet 0.3, but the test half did not move
+# (recall@50 0.62 -> 0.62, median rank 28 -> 28). With n this small that is noise,
+# so the documented weights are kept. Re-tune once more known sonnets are located.
+WEIGHTS = {"meter": 0.25, "syllable": 0.15, "rhyme": 0.35, "couplet": 0.25}
+COMPONENTS = ("meter", "syllable", "rhyme", "couplet")
+WINDOW_SIZES = (10, 11, 14, 15, 18)
+NMS_RADIUS = max(WINDOW_SIZES)          # suppress hits closer than one window
+
+# ---------- 1. Tokenising (bug 2) --------------------------------------------
+# Gutenberg uses curly apostrophes (’) and _underscores_ for italics.
+# r"\w+" split "sister’s" into "sister" + "s" (an extra stressed beat) and
+# kept "_" as a word, so an italic line ending "tongue._" ended in "_".
+_APOS = str.maketrans({"’": "'", "‘": "'", "ʼ": "'"})
+_WORD_RE = re.compile(r"'?[A-Za-z]+(?:'[A-Za-z]+)*'?")
+
+def normalize_line(line):
+    return line.translate(_APOS).replace("_", "")
+
+def tokenize_words(line):
+    """Words of a verse line, apostrophes kept inside words ("o'er", "'tis")."""
+    return _WORD_RE.findall(normalize_line(line))
+
+def end_word(line):
+    words = tokenize_words(line)
+    return words[-1].lower().strip("'") if words else ""
+
+# ---------- 2. Pronunciation lookup ------------------------------------------
+# A few Early Modern forms CMU lacks.
+_EME_PRONS = {
+    "o'er": [["OW1", "R"]], "e'er": [["EH1", "R"]], "ne'er": [["N", "EH1", "R"]],
+    "th'": [["DH"]], "i'": [["IH0"]], "o'": [["AH0"]], "ta'en": [["T", "EY1", "N"]],
+    "eyne": [["AY1", "N"]], "hie": [["HH", "AY1"]], "wot": [["W", "AA1", "T"]],
+}
+_CONS = {"s": "Z", "st": "S T", "d": "D", "t": "T"}
+
+@lru_cache(maxsize=None)
+def _cmu_prons(word):
+    """All CMU pronunciations of word (lower-case), handling elisions; None if unknown."""
+    w = word.lower()
+    if w in d: return d[w]
+    if w in _EME_PRONS: return _EME_PRONS[w]
+    bare = w.strip("'")
+    if bare in d: return d[bare]
+    # possessive / elided endings: sister's, liv'st, lov'd  -> base + consonant, no extra syllable
+    for suf in ("'st", "'d", "'s", "'t"):
+        if w.endswith(suf):
+            base = w[: -len(suf)]
+            for cand in (base, base + "e"):
+                if cand in d:
+                    tail = _CONS[suf[1:]].split()
+                    return [p + tail for p in d[cand]]
+    joined = w.replace("'", "")
+    if joined in d: return d[joined]
+    return None
+
+_G2P_MODEL = None
+@lru_cache(maxsize=None)
+def _g2p_prons(word):
+    """Neural G2P for out-of-vocabulary words only (g2p_en itself uses CMU for known words)."""
+    global _G2P_MODEL
+    if _G2P_MODEL is None:
+        _G2P_MODEL = G2p()
+    phones = [p for p in _G2P_MODEL(word) if p.strip()]
+    return [phones] if phones else None
+
+def word_prons(word, mode="cmu"):
+    prons = _cmu_prons(word)
+    if prons is None and mode == "g2p":
+        prons = _g2p_prons(word.lower().strip("'"))
+    return prons
+
+def _fallback_syllables(word):
+    w = word.lower().replace("'", "")
+    n = len(re.findall(r"[aeiouy]+", w))
+    if w.endswith("e") and not w.endswith(("le", "ee", "ye")) and n > 1:
+        n -= 1                                   # silent final e
+    return max(n, 1) if w else 0
+
+def count_syllables(word, mode="cmu"):
+    prons = word_prons(word, mode)
+    if prons:
+        return sum(p[-1].isdigit() for p in prons[0])
+    return _fallback_syllables(word)
+
+# ---------- 3. Stress and meter (method 4) -----------------------------------
+# CMU marks nearly every monosyllable as stressed ("my", "do", "with"), which
+# made ordinary iambic lines look irregular. Monosyllabic function words are
+# now unstressed, other monosyllables stressed, and both are "flexible":
+# a flexible syllable in the "wrong" slot costs 0.5 instead of 1.
+FUNCTION_WORDS = set("""
+a an the and but or nor for so yet if as than that though while when where whence
+whose who whom which what i me my mine we us our you your ye thou thee thy thine
+he him his she her it its they them their this these those there here
+to of in on at by from with without into upon unto o'er through
+am is are was were be been being do does did doth dost hath hast have has had
+shall shalt should will wilt would can canst could may mayst might must
+not no all such some each own 'tis 'twas t' th' i' o' 'gainst
+""".split())
+
+@lru_cache(maxsize=None)
+def word_stress(word, mode="cmu"):
+    """Tuple of (stress, flexible) per syllable."""
+    w = word.lower()
+    prons = word_prons(w, mode)
+    if prons:
+        stresses = [int(p[-1]) for p in prons[0] if p[-1].isdigit()]
     else:
-        # Fallback: count vowels
-        return len(re.findall(r'[aeiouy]+', word))
+        stresses = [None] * _fallback_syllables(w)          # unknown word
+    if len(stresses) == 1:
+        return ((0, True),) if w.strip("'") in FUNCTION_WORDS or w in FUNCTION_WORDS else ((1, True),)
+    out = []
+    for s in stresses:
+        if s is None: out.append((1, True))                  # unknown: no hard claim
+        elif s == 1: out.append((1, False))
+        elif s == 2: out.append((1, True))                   # secondary stress is flexible
+        else: out.append((0, False))
+    return tuple(out)
 
-def get_rhyme_part(word):
-    word = word.lower().strip(".,;:!?()[]\"'")
-    if not word or word not in d:
-        return None
+def get_stress_pattern(line, mode="cmu"):
+    """0/1 pattern (kept for old plotting code); see line_stress for flexibility."""
+    return [s for s, _ in line_stress(line, mode)]
 
-    pronunciation = d[word][0]
-    # Find the last stressed vowel
-    for i in range(len(pronunciation) - 1, -1, -1):
-        phone = pronunciation[i]
-        if phone[-1].isdigit() and int(phone[-1]) > 0: # Stressed
-            return tuple(pronunciation[i:])
-    return tuple(pronunciation[-1:]) # Fallback to last sound
+@lru_cache(maxsize=None)
+def line_stress(line, mode="cmu"):
+    out = []
+    for w in tokenize_words(line):
+        out.extend(word_stress(w, mode))
+    return tuple(out)
 
-def get_stress_pattern(line):
-    # Simplified stress pattern: 1 for stressed, 0 for unstressed
-    words = re.findall(r"\w+", line)
-    pattern = []
-    for w in words:
-        w_lower = w.lower()
-        if w_lower in d:
-            # Take first pronunciation
-            pron = d[w_lower][0]
-            # Extract stresses
-            stresses = [int(p[-1]) for p in pron if p[-1].isdigit()]
-            # Simplify: 1 or 2 is stress (1), 0 is unstressed (0)
-            pattern.extend([1 if s > 0 else 0 for s in stresses])
-        else:
-            # Guess: 1 syllable = 1, >1 = 101...
-            syls = count_syllables(w)
-            pattern.extend([1] * syls) # Very rough guess
-    return pattern
+_IAMB = [0, 1] * 5
+_TEMPLATES = [
+    _IAMB,                        # regular pentameter
+    [1, 0] + _IAMB[2:],           # trochaic first foot
+    _IAMB + [0],                  # feminine ending
+    [1, 0] + _IAMB[2:] + [0],     # both
+]
+
+def _align_cost(pattern, template):
+    """Edit distance: hard mismatch 1, flexible mismatch 0.5, missing/extra syllable 1."""
+    n, m = len(pattern), len(template)
+    prev = [float(j) for j in range(m + 1)]
+    for i in range(1, n + 1):
+        s, flex = pattern[i - 1]
+        cur = [float(i)] + [0.0] * m
+        for j in range(1, m + 1):
+            sub = 0.0 if s == template[j - 1] else (0.5 if flex else 1.0)
+            cur[j] = min(prev[j - 1] + sub, prev[j] + 1.0, cur[j - 1] + 1.0)
+        prev = cur
+    return prev[m]
+
+def meter_score(pattern):
+    """Best alignment of a line's stresses against iambic pentameter variants (0-1)."""
+    if len(pattern) < 7 or len(pattern) > 14:
+        return 0.0
+    cost = min(_align_cost(pattern, t) for t in _TEMPLATES)
+    return max(0.0, 1.0 - cost / 10.0)
 
 def is_iambic(pattern):
-    # Ideal iambic pentameter: 0101010101 (10 syllables)
-    # We allow variations.
-    if len(pattern) < 8 or len(pattern) > 12:
+    """Backward-compatible wrapper: accepts a plain 0/1 list."""
+    return meter_score(tuple((s, False) for s in pattern))
+
+def syllable_score(pattern):
+    n = len(pattern)
+    if n == 10 or (n == 11 and pattern[-1][0] == 0):     # 11 only with an unstressed (feminine) ending
+        return 1.0
+    return max(0.0, 1.0 - 0.1 * abs(n - 10))
+
+@lru_cache(maxsize=None)
+def line_features(line, mode="cmu"):
+    """Everything the rule score needs from ONE line, computed once and cached
+    (a line sits in ~68 overlapping windows of sizes 10-18)."""
+    pat = line_stress(line, mode)
+    return meter_score(pat), syllable_score(pat), end_word(line)
+
+# ---------- 4. Rhyme (bug 1, method 4) ---------------------------------------
+_HISTORICAL_GROUPS = [
+    ["love", "move", "prove", "remove", "approve", "reprove"],
+    ["gone", "alone", "moan", "one", "none", "done", "shown", "own", "upon", "on"],
+    ["forth", "worth"],
+    ["wind", "mind", "kind", "find", "behind", "blind"],
+    ["come", "doom", "tomb", "home", "roam"],
+    ["heaven", "even", "given", "driven", "riven"],
+    ["great", "defeat", "seat", "eat", "conceit"],
+    ["tongue", "young", "song", "wrong", "long", "sung", "strong", "among"],
+    ["war", "are", "far", "star", "jar"],
+    ["blood", "good", "flood", "stood", "food", "brood", "mood"],
+    ["eye", "melancholy", "remedy", "majesty", "die", "lie", "history"],
+]
+HISTORICAL_RHYMES = defaultdict(set)
+for group in _HISTORICAL_GROUPS:
+    for a in group:
+        HISTORICAL_RHYMES[a].update(g for g in group if g != a)
+
+def _strip(phones):
+    return tuple(re.sub(r"\d", "", ph) for ph in phones)
+
+def _rhyme_parts(prons):
+    """Last STRESSED vowel to the end, stress digits removed (so AY1 matches AY2)."""
+    parts = set()
+    for p in prons:
+        idx = next((i for i in range(len(p) - 1, -1, -1) if p[i][-1] in "12"), None)
+        if idx is None:
+            idx = next((i for i in range(len(p) - 1, -1, -1) if p[i][-1].isdigit()), len(p) - 1)
+        parts.add(_strip(p[idx:]))
+    return parts
+
+def _final_syllable_parts(prons):
+    """Last vowel (stressed or not) to the end: dignity/mutiny, argument/punishment."""
+    parts = set()
+    for p in prons:
+        idx = next((i for i in range(len(p) - 1, -1, -1) if p[i][-1].isdigit()), None)
+        if idx is not None:
+            parts.add(_strip(p[idx:]))
+    return parts
+
+def _n_syll(prons):
+    return sum(ph[-1].isdigit() for ph in prons[0])
+
+@lru_cache(maxsize=None)
+def rhyme_level(w1, w2, mode="cmu"):
+    """
+    1.0  perfect rhyme (same stressed vowel + everything after it) or a listed historical rhyme
+    0.5  weaker rhyme: identical word; same final syllable in a polysyllable (dignity/mutiny);
+         Early Modern '-y' = 'eye' (perjury/eye); same stressed vowel, different coda (slant)
+    0.0  otherwise.
+    The old rule also accepted 'same last two letters' or 'same last vowel LETTER', which made
+    ~30% of random line-end pairs 'rhyme' (love/time).
+    """
+    w1, w2 = w1.lower().strip("'"), w2.lower().strip("'")
+    if not w1 or not w2:
         return 0.0
+    if w1 == w2:
+        return 0.5
+    if w2 in HISTORICAL_RHYMES.get(w1, ()):
+        return 1.0
+    p1, p2 = word_prons(w1, mode), word_prons(w2, mode)
+    if p1 and p2:
+        r1, r2 = _rhyme_parts(p1), _rhyme_parts(p2)
+        if r1 & r2:
+            return 1.0
+        if max(_n_syll(p1), _n_syll(p2)) > 1 and _final_syllable_parts(p1) & _final_syllable_parts(p2):
+            return 0.5
+        ay1 = any(r[0] == "AY" for r in r1); ay2 = any(r[0] == "AY" for r in r2)
+        if (ay1 and w2.endswith("y") and _n_syll(p2) > 1) or (ay2 and w1.endswith("y") and _n_syll(p1) > 1):
+            return 0.5
+        v1 = {r[0] for r in r1 if r}; v2 = {r[0] for r in r2 if r}
+        return 0.5 if v1 & v2 else 0.0
+    # unknown word: only a 3-letter spelling match, and only as a weak rhyme
+    if len(w1) >= 3 and len(w2) >= 3 and w1[-3:] == w2[-3:] and re.search(r"[aeiouy]", w1[-3:]):
+        return 0.5
+    return 0.0
 
-    # Compare with ideal 0101010101...
-    ideal = [0, 1] * 6
-    ideal = ideal[:len(pattern)]
+def check_rhyme(w1, w2, mode="cmu", min_level=0.5):
+    """Yes/no rhyme, used ONLY for scheme labels (ABAB / ABBA ...), never for scoring.
+    Accepts weak rhymes: with min_level=1.0 the first run labelled Sonnet 1 'Irregular'
+    because die/memory is an Early Modern '-y' rhyme (level 0.5)."""
+    return rhyme_level(w1, w2, mode) >= min_level
 
-    matches = sum(1 for x, y in zip(pattern, ideal) if x == y)
-    return matches / len(pattern)
+# ---------- 5. The one window scorer -----------------------------------------
+_SCHEMES = [((0, 2), (1, 3), 1.0),   # ABAB
+            ((0, 3), (1, 2), 0.8),   # ABBA
+            ((0, 1), (2, 3), 0.6)]   # AABB  (old AAAA branch was unreachable: AAAA also matches AABB)
 
-print("NLP Tools Ready.")
+def quatrain_score(w, mode="cmu"):
+    best = 0.2 * max(rhyme_level(w[0], w[2], mode), rhyme_level(w[1], w[3], mode))
+    for a, b, val in _SCHEMES:
+        best = max(best, val * min(rhyme_level(w[a[0]], w[a[1]], mode),
+                                   rhyme_level(w[b[0]], w[b[1]], mode)))
+    return best
+
+def window_parts(lines, mode="cmu"):
+    """Component scores (meter, syllable, rhyme, couplet) for one window, each 0-1."""
+    if len(lines) < 8:
+        return np.zeros(4)
+    feats = [line_features(l, mode) for l in lines]
+    meter = np.mean([f[0] for f in feats])
+    syll = np.mean([f[1] for f in feats])
+    ends = [f[2] for f in feats]
+    body = ends[:-2]
+    nq, rem = divmod(len(body), 4)
+    q = [quatrain_score(body[i:i + 4], mode) for i in range(0, nq * 4, 4)]
+    rhyme = (np.mean(q) if q else 0.0) * (1.0 if (nq == 3 and rem == 0) else 0.75)
+    couplet = rhyme_level(ends[-2], ends[-1], mode)
+    return np.array([meter, syll, rhyme, couplet])
+
+def weights_vector(weights=None):
+    weights = weights or WEIGHTS
+    return np.array([weights[c] for c in COMPONENTS])
+
+def score_window(lines, weights=None, mode="cmu"):
+    return float(window_parts(lines, mode) @ weights_vector(weights))
+
+# ---------- 6. One line cleaner for every cell (bug 6, method 2) ------------
+_SPEAKER_RE = re.compile(r"^[A-Z][A-Z’'\-,&\. ]*[A-Z]\.$")
+_DIRECTION_RE = re.compile(r"^(Enter|Exit|Exeunt|Re-enter|Flourish|Alarum|Sennet|Music|Thunder)\b")
+_INLINE_DIRECTION_RE = re.compile(r"\[[^\]]*\]")
+_NUMBER_RE = re.compile(r"^[0-9IVXLC]+\.?$")
+
+def clean_play_lines(lines):
+    """
+    Turn a work's raw lines into spoken text only.
+    Returns clean_data = [(text, speaker)], boundaries = [(clean_idx, label, 'act'|'scene')].
+    Removes: blank lines, ACT/SCENE headings, speaker tags (ROMEO.), stage directions
+    ([Exit.], Enter ..., inline [_Aside_]) and italic underscores.
+    Every scan, classifier window and plot uses THIS function, so line index i means
+    the same line everywhere.
+    """
+    clean_data, boundaries = [], []
+    speaker = "UNKNOWN"
+    in_direction = False                      # inside a [ ... ] that spans several lines
+    for raw in lines:
+        s = raw.strip()
+        if not s:
+            continue
+        if in_direction:                      # skip until the closing bracket
+            if "]" in s:
+                in_direction = False
+                s = s.split("]", 1)[1].strip()
+                if not s:
+                    continue
+            else:
+                continue
+        up = s.upper()
+        if up.startswith("ACT ") or up.startswith("SCENE "):
+            kind = "act" if up.startswith("ACT ") else "scene"
+            boundaries.append((len(clean_data), s.split(".")[0], kind))
+            continue
+        if up in ("PROLOGUE.", "EPILOGUE."):  # a speaker in MND 5.1, a section elsewhere: both
+            boundaries.append((len(clean_data), s.rstrip("."), "scene"))
+            speaker = s.rstrip(".")
+            continue
+        if len(s) < 40 and _SPEAKER_RE.match(s.translate(_APOS)):
+            speaker = s.rstrip(".")
+            continue
+        if _DIRECTION_RE.match(s):
+            continue
+        # First run: lines like "[_To Juliet._] If I profane with my unworthiest hand"
+        # were dropped whole because they start with "[". Strip the bracketed part
+        # and keep whatever verse follows it.
+        s = _INLINE_DIRECTION_RE.sub("", s)
+        if "[" in s:                          # an opening bracket with no close on this line
+            s, in_direction = s.split("[", 1)[0], True
+        s = s.replace("_", "").strip()
+        if not s or s.isupper() or _NUMBER_RE.match(s):   # titles, sonnet numbers, empty
+            continue
+        clean_data.append((s, speaker))
+    return clean_data, boundaries
+
+# ---------- 7. Scanning with caching -----------------------------------------
+SCAN_CACHE = {}
+
+def scan_work(title, lines, mode="cmu", window_sizes=WINDOW_SIZES, use_cache=True):
+    """
+    Score every start position with every window size, fast.
+    Per-line features are computed once; per-quatrain and per-couplet rhyme scores are
+    computed once per start line; a window's score is then assembled from those pieces.
+    (Gives exactly the same numbers as window_parts on each window.)
+    Returns dict with:
+      parts  : array (n_lines, n_sizes, 4) of component scores (NaN where the window doesn't fit)
+      clean_data, boundaries, window_sizes
+    Re-weighting later is a dot product, so tuning WEIGHTS never needs a re-scan.
+    """
+    key = (title, mode, tuple(window_sizes))
+    if use_cache and key in SCAN_CACHE:
+        return SCAN_CACHE[key]
+    clean_data, boundaries = clean_play_lines(lines)
+    text = [t for t, _ in clean_data]
+    n = len(text)
+    feats = [line_features(t, mode) for t in text]
+    meter = np.array([f[0] for f in feats]); syll = np.array([f[1] for f in feats])
+    ends = [f[2] for f in feats]
+    cm = np.concatenate([[0.0], np.cumsum(meter)]); cs = np.concatenate([[0.0], np.cumsum(syll)])
+    quat = np.array([quatrain_score(ends[j:j + 4], mode) if j + 4 <= n else 0.0 for j in range(n)])
+    coup = np.array([rhyme_level(ends[j], ends[j + 1], mode) if j + 1 < n else 0.0 for j in range(n)])
+    parts = np.full((n, len(window_sizes), 4), np.nan)
+    for k, w in enumerate(window_sizes):
+        if w < 8 or w > n:
+            continue
+        nq, rem = divmod(w - 2, 4)
+        mult = 1.0 if (nq == 3 and rem == 0) else 0.75
+        starts = np.arange(0, n - w + 1)
+        parts[starts, k, 0] = (cm[starts + w] - cm[starts]) / w
+        parts[starts, k, 1] = (cs[starts + w] - cs[starts]) / w
+        if nq:
+            parts[starts, k, 2] = np.mean([quat[starts + 4 * q] for q in range(nq)], axis=0) * mult
+        else:
+            parts[starts, k, 2] = 0.0
+        parts[starts, k, 3] = coup[starts + w - 2]
+    res = {"parts": parts, "clean_data": clean_data, "boundaries": boundaries,
+           "window_sizes": tuple(window_sizes)}
+    SCAN_CACHE[key] = res
+    return res
+
+def scores_from_scan(scan, weights=None):
+    """Best score over window sizes at each start line, and which size won."""
+    s = np.nan_to_num(scan["parts"] @ weights_vector(weights), nan=0.0)
+    if s.size == 0:
+        return np.zeros(0), np.zeros(0, dtype=int)
+    best = s.argmax(axis=1)
+    return s.max(axis=1), np.array(scan["window_sizes"])[best]
+
+def analyze_work(title, lines, weights=None, mode="cmu", verbose=True):
+    """Drop-in replacement for the old analyze_work copies: (scores, clean_data, boundaries)."""
+    if verbose:
+        print(f"Analyzing {title}...")
+    scan = scan_work(title, lines, mode)
+    scores, _ = scores_from_scan(scan, weights)
+    return list(scores), scan["clean_data"], scan["boundaries"]
+
+# ---------- 8. Non-maximum suppression (one copy) ----------------------------
+def nms_top_k(scores, k=10, radius=NMS_RADIUS):
+    """Indices of the k best positions, none within `radius` lines of a better one."""
+    scores = np.asarray(scores)
+    taken = np.zeros(len(scores), dtype=bool)
+    picked = []
+    for idx in np.argsort(scores)[::-1]:
+        if k is not None and len(picked) >= k:
+            break
+        if taken[idx]:
+            continue
+        picked.append(int(idx))
+        taken[max(0, idx - radius + 1): idx + radius] = True
+    return picked
+
+def window_lines(clean_data, idx, size=14):
+    """Lines of a window, clipped at the end of the work (bug 11)."""
+    return [t for t, _ in clean_data[idx: min(idx + size, len(clean_data))]]
+
+
+# ---------- 9. Shared parsing helpers (one copy each) ------------------------
+NON_PLAY_TITLES = {"THE SONNETS", "A LOVER’S COMPLAINT", "THE PASSIONATE PILGRIM",
+                   "THE PHOENIX AND THE TURTLE", "THE RAPE OF LUCRECE", "VENUS AND ADONIS",
+                   "PLAY SONNETS"}      # PLAY SONNETS is a synthetic copy of text already in the plays
+_SONNET_HEADER_RE = re.compile(r"^(\d+|[XVILC]+)\.?$")
+
+def parse_sonnets_map(works, min_lines=10):
+    """{sonnet number: [lines]} for THE SONNETS (replaces 4 separate parsing loops)."""
+    out, cur, num = {}, [], 0
+    for line in works.get("THE SONNETS", []):
+        s = line.strip()
+        if not s or s == "THE SONNETS":
+            continue
+        if _SONNET_HEADER_RE.match(s):
+            if len(cur) >= min_lines:
+                out[num] = cur
+            cur = []
+            try: num = int(s.strip("."))
+            except ValueError: num += 1
+        else:
+            cur.append(s)
+    if len(cur) >= min_lines:
+        out[num] = cur
+    return out
+
+def parse_play_sonnets(works):
+    """[(label, [lines])] for the synthetic PLAY SONNETS work, speaker tags removed."""
+    out, label, cur = [], None, []
+    for line in works.get("PLAY SONNETS", []):
+        m = re.match(r"^=== PLAY SONNET \d+: (.*) \(\d+ lines\) ===$", line)
+        if m:
+            if label is not None: out.append((label, cur))
+            label, cur = m.group(1), []
+        elif line.strip() and not _SPEAKER_RE.match(line.strip().translate(_APOS)):
+            cur.append(line.strip())
+    if label is not None: out.append((label, cur))
+    return out
+
+def get_sonnet_date(num):
+    """Approximate composition date of a sonnet (one copy; used by cells 9 and 10b)."""
+    if 1 <= num <= 60: return 1596
+    elif 61 <= num <= 77: return 1594.5
+    elif 78 <= num <= 86: return 1599
+    elif 87 <= num <= 103: return 1594.5
+    elif 104 <= num <= 126: return 1602
+    elif 127 <= num <= 144: return 1593
+    elif num == 145: return 1582
+    elif 146 <= num <= 154: return 1593
+    return None
+
+# ---------- 10. Statistics for dependent data (method 5) --------------------
+def ar1_wavelet_threshold(sig, scales, wavelet="cmor1.5-1.0", smooth_sigma=(2, 2),
+                          n_surr=30, q=0.95, seed=0):
+    """
+    Red-noise significance for a wavelet power spectrum (Torrence & Compo 1998, by simulation).
+
+    The detection signal comes from overlapping windows, so neighbouring values are strongly
+    correlated: it behaves like red noise, which naturally has lots of power at long periods.
+    A white-noise threshold (variance * chi2) therefore calls far too much "significant".
+
+    Here we fit AR(1) (lag-1 autocorrelation alpha), simulate n_surr AR(1) series with the
+    same alpha and variance, push each through the SAME wavelet + smoothing, and take the
+    q-quantile of their power at each scale. Simulating (instead of using the analytic
+    formula) makes the threshold automatically match pywt's normalisation and the smoothing.
+
+    Returns (threshold per scale, alpha). Significant where power_smooth / threshold[:, None] > 1.
+    """
+    sig = np.asarray(sig, float) - np.mean(sig)
+    n = len(sig)
+    var = np.var(sig)
+    alpha = float(np.corrcoef(sig[:-1], sig[1:])[0, 1]) if n > 2 and var > 0 else 0.0
+    alpha = min(max(alpha, 0.0), 0.99)
+    rng = np.random.default_rng(seed)
+    pooled = []
+    for _ in range(n_surr):
+        e = rng.normal(0, np.sqrt(var * (1 - alpha ** 2)), n)
+        x = np.empty(n); x[0] = rng.normal(0, np.sqrt(var))
+        for t in range(1, n):
+            x[t] = alpha * x[t - 1] + e[t]
+        c, _ = pywt.cwt(x - x.mean(), scales, wavelet, method="fft")
+        pooled.append(gaussian_filter(np.abs(c) ** 2, sigma=smooth_sigma))
+    pooled = np.stack(pooled)                        # surrogates x scales x time
+    # Use only points inside the cone of influence: edge-affected power is artificially low
+    # and would drag the threshold down.
+    t = np.arange(n); edge = np.minimum(t, n - 1 - t)
+    thr = np.empty(len(scales))
+    for k, sc in enumerate(scales):
+        inside = edge >= np.sqrt(2) * sc
+        vals = pooled[:, k, inside] if inside.sum() >= 10 else pooled[:, k, :]
+        thr[k] = np.quantile(vals, q)
+    return thr, alpha
+
+def window_permutation_test(values_per_line, weights_per_line, starts, size=14,
+                            n_perm=5000, seed=0, min_gap=None):
+    """
+    Is the rate in the chosen windows unusual for this play?  The unit is the WINDOW, not
+    the line: lines inside one window share speaker, scene and topic, so treating 280 lines
+    as 280 independent samples (a t-test) overstates the evidence.
+
+    values_per_line: e.g. rare-word count per line;  weights_per_line: tokens per line.
+    observed = mean over the chosen windows of (sum values / sum weights).
+    null     = the same statistic for len(starts) randomly placed, non-overlapping windows.
+    Returns dict(observed, null_mean, null_sd, p_two_sided, p_greater).
+    """
+    v = np.concatenate([[0.0], np.cumsum(values_per_line)])
+    w = np.concatenate([[0.0], np.cumsum(weights_per_line)])
+    n = len(values_per_line)
+    def rate(st):
+        st = np.asarray(st)
+        num, den = v[st + size] - v[st], w[st + size] - w[st]
+        return float(np.mean(num / np.maximum(den, 1)))
+    starts = [s for s in starts if s + size <= n]
+    k = len(starts)
+    obs = rate(starts)
+    rng = np.random.default_rng(seed)
+    gap = min_gap or size
+    null = np.empty(n_perm)
+    for b in range(n_perm):
+        picked, taken = [], np.zeros(n, bool)
+        for s0 in rng.permutation(n - size + 1):
+            if not taken[s0]:
+                picked.append(s0)
+                taken[max(0, s0 - gap + 1): s0 + gap] = True
+                if len(picked) == k:
+                    break
+        null[b] = rate(picked)
+    mu = null.mean()
+    return {"observed": obs, "null_mean": mu, "null_sd": null.std(), "n_windows": k,
+            "p_two_sided": (1 + np.sum(np.abs(null - mu) >= abs(obs - mu))) / (1 + n_perm),
+            "p_greater": (1 + np.sum(null >= obs)) / (1 + n_perm)}
+
+print("Shared toolkit ready:", WEIGHTS)
 
 
 # %% [markdown] id="HcUytcCionud"
@@ -642,125 +1166,38 @@ print("NLP Tools Ready.")
 # ## Preparation text & Detector
 
 # %% colab={"base_uri": "https://localhost:8080/"} id="JJFFwmZ_ox1_" outputId="be95656e-f045-4dc4-e2e4-05ee7848a80b"
-# Cell 5: Structural Feature Extraction & Improved Sonnet Detector
-# Note: We extend the existing NLP tools with a class-based detector for feature extraction.
-
-class SonnetDetectorWrapper:
-    """
-    Wrapper around the global NLP functions and dictionary 'd'
-    to provide a consistent interface for the StructuralFeatures transformer.
-    Includes the RELAXED rhyme check logic.
-    """
-    def __init__(self, cmu_dict):
-        self.d = cmu_dict
-
-    def count_syllables(self, word):
-        # Re-uses the global function logic or implements it directly
-        word = word.lower().strip(".,;:!?()[]\"'")
-        if not word: return 0
-        if word in self.d:
-            return [len(list(y for y in x if y[-1].isdigit())) for x in self.d[word]][0]
-        else:
-            return len(re.findall(r'[aeiouy]+', word))
-
-    def get_rhyme_part(self, word):
-        word = word.lower().strip(".,;:!?()[]\"'")
-        if not word or word not in self.d: return None
-        pronunciation = self.d[word][0]
-        # Strategy 1: Stressed vowel to end
-        for i in range(len(pronunciation) - 1, -1, -1):
-            phone = pronunciation[i]
-            if phone[-1].isdigit() and int(phone[-1]) > 0:
-                return tuple(pronunciation[i:])
-        # Strategy 2: Fallback to last vowel (RELAXED LOGIC)
-        for i in range(len(pronunciation) - 1, -1, -1):
-             phone = pronunciation[i]
-             if phone[-1].isdigit():
-                 return tuple(pronunciation[i:])
-        return tuple(pronunciation[-1:])
-
-    def check_rhyme(self, w1, w2):
-        r1 = self.get_rhyme_part(w1)
-        r2 = self.get_rhyme_part(w2)
-        if r1 and r2:
-            if r1 == r2: return True
-            # Relaxed: Allow last phone match if it's a vowel (weak rhyme/slant rhyme)
-            if r1[-1] == r2[-1] and r1[-1][-1].isdigit(): return True
-        return False
-
-    def get_stress_pattern(self, line):
-        words = re.findall(r"\w+", line)
-        pattern = []
-        for w in words:
-            w_lower = w.lower()
-            if w_lower in self.d:
-                pron = self.d[w_lower][0]
-                stresses = [int(p[-1]) for p in pron if p[-1].isdigit()]
-                pattern.extend([1 if s > 0 else 0 for s in stresses])
-            else:
-                syls = self.count_syllables(w)
-                pattern.extend([1] * syls)
-        return pattern
-
-    def is_iambic(self, pattern):
-        if len(pattern) < 8 or len(pattern) > 12: return 0.0
-        ideal = [0, 1] * 6
-        ideal = ideal[:len(pattern)]
-        matches = sum(1 for x, y in zip(pattern, ideal) if x == y)
-        return matches / len(pattern)
-
-# Initialize the wrapper with the global dictionary 'd' from Cell 1
-detector_wrapper = SonnetDetectorWrapper(d)
+# Cell 5: Structural Feature Extraction
+# The classifiers now use the SAME syllable, stress and rhyme code as the rule
+# detector (shared toolkit, cell 4), instead of a second copy with its own
+# looser rhyme rule.
 
 class StructuralFeatures(BaseEstimator, TransformerMixin):
-    def __init__(self, detector):
-        self.detector = detector
+    """Three form features per passage: rhyme density, syllable-count variance, mean meter score."""
+    def __init__(self, n_lines=14, mode="cmu"):
+        self.n_lines = n_lines
+        self.mode = mode
 
     def fit(self, X, y=None):
         return self
 
+    def _one(self, text):
+        lines = [l for l in text.split("\n") if l.strip()][: self.n_lines]
+        if not lines:
+            return [0.0, 0.0, 0.0]                          # bug 4: was 4 values here, 3 below
+        feats = [line_features(l, self.mode) for l in lines]
+        ends = [f[2] for f in feats]
+        # 1. Rhyme density: graded rhyme level summed over all end-word pairs,
+        #    normalised by the 7 rhyme pairs a Shakespearean sonnet has
+        rhyme = sum(rhyme_level(ends[i], ends[j], self.mode)
+                    for i in range(len(ends)) for j in range(i + 1, len(ends))) / 7.0
+        # 2. Line-length variance (syllables per line)
+        syl = [len(line_stress(l, self.mode)) for l in lines]
+        # 3. Mean meter score (alignment-based)
+        meter = float(np.mean([f[0] for f in feats]))
+        return [rhyme, float(np.var(syl)), meter]
+
     def transform(self, X):
-        features = []
-        for text in X:
-            lines = text.split('\n')
-            if not lines:
-                features.append([0, 0, 0, 0])
-                continue
-            lines_14 = lines[:14]
-            if len(lines_14) < 14:
-                lines_14 += [""] * (14 - len(lines_14))
-
-            # 1. Rhyme Density
-            last_words = []
-            for l in lines_14:
-                words = re.findall(r"\w+", l)
-                last_words.append(words[-1] if words else "")
-
-            rhyme_pairs = 0
-            for i in range(len(last_words)):
-                for j in range(i + 1, len(last_words)):
-                    if self.detector.check_rhyme(last_words[i], last_words[j]):
-                        rhyme_pairs += 1
-            rhyme_density = rhyme_pairs / 20.0
-
-            # 2. Line Length Variance
-            syllable_counts = []
-            for l in lines_14:
-                words = re.findall(r"\w+", l)
-                count = sum(self.detector.count_syllables(w) for w in words)
-                syllable_counts.append(count)
-            length_var = np.var(syllable_counts) if syllable_counts else 100.0
-
-            # 3. Iambic Score
-            iambic_scores = []
-            for l in lines_14:
-                pattern = self.detector.get_stress_pattern(l)
-                iambic_scores.append(self.detector.is_iambic(pattern))
-            avg_iambic = np.mean(iambic_scores) if iambic_scores else 0.0
-
-            features.append([rhyme_density, length_var, avg_iambic])
-
-        return np.array(features)
+        return np.array([self._one(t) for t in X], dtype=float)
 
 print("Structural Feature Extractor Ready.")
 
@@ -770,103 +1207,107 @@ print("Structural Feature Extractor Ready.")
 
 # %% colab={"base_uri": "https://localhost:8080/"} id="lOELrvOgo-ig" outputId="7fb6dd95-0759-45c8-ff8d-79650eee0047"
 # Cell 6: Training Hybrid Classifiers (Supervised & PU)
+# Changes vs. the first version:
+#  * every play window is built from clean_play_lines(): no speaker tags, stage
+#    directions or act headings, so the model can't learn "no names = sonnet"
+#  * PLAY SONNETS (a synthetic copy of passages already inside the plays) is
+#    excluded from the unlabeled pool and the scan
+#  * models are scored on HELD-OUT folds (cross-validation), not their own training data
+#  * PU model is trained without class_weight and c is estimated on held-out positives
 
-# 1. Helper to extract Canonical Sonnets (Positives)
-def extract_canonical_sonnets(works):
-    if "THE SONNETS" not in works: return []
-    lines = works["THE SONNETS"]
-    sonnets = []
-    current = []
-    for line in lines:
-        if re.match(r'^[XVI]+\.?$', line) or re.match(r'^\d+\.?$', line):
-            if len(current) >= 12: sonnets.append("\n".join(current))
-            current = []
-        else:
-            current.append(line)
-    if len(current) >= 12: sonnets.append("\n".join(current))
-    return sonnets
+CV = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
 
-all_positive_texts = extract_canonical_sonnets(works)
+def clean_block(lines):
+    return "\n".join(t for t, _ in clean_play_lines(lines)[0])
+
+# 1. Positives: the 154 canonical sonnets (same cleaner, so both classes are treated alike)
+sonnets_map = parse_sonnets_map(works, min_lines=12)
+all_positive_texts = [clean_block(v) for _, v in sorted(sonnets_map.items())]
 print(f"Extracted {len(all_positive_texts)} positive sonnets.")
 
-# 2. Helper to make Hard Negatives (Real Blank Verse)
-def make_hard_negatives(works, n_samples=200, block_len=14, random_state=42):
-    rng = np.random.RandomState(random_state)
-    all_play_lines = []
-    exclude_titles = {"THE SONNETS", "A LOVER’S COMPLAINT", "THE PASSIONATE PILGRIM", "THE PHOENIX AND THE TURTLE", "THE RAPE OF LUCRECE", "VENUS AND ADONIS", "PLAY SONNETS"}
-
-    for title, lines in works.items():
-        if title in exclude_titles: continue
-        all_play_lines.extend([l for l in lines if l.strip()])
-
-    blocks = []
-    for i in range(0, len(all_play_lines) - block_len, block_len // 2):
-        block = all_play_lines[i : i + block_len]
-        blocks.append("\n".join(block))
-
-    if len(blocks) > n_samples:
-        indices = rng.choice(len(blocks), size=n_samples, replace=False)
-        return [blocks[i] for i in indices]
-    return blocks
-
-# 3. Train Supervised Model (Pos vs Hard Negatives)
-print("\n--- Training Supervised Classifier (Pos vs Hard Negatives) ---")
-hard_negatives = make_hard_negatives(works, n_samples=len(all_positive_texts), random_state=123)
-y_sup = np.array([1] * len(all_positive_texts) + [0] * len(hard_negatives))
-X_sup = all_positive_texts + hard_negatives
-
-pipeline_sup = Pipeline([
-    ('features', FeatureUnion([
-        ('tfidf', TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_features=100)), # Low dim TF-IDF
-        ('structural', StructuralFeatures(detector_wrapper))
-    ])),
-    ('scaler', StandardScaler(with_mean=False)),
-    ('clf', LogisticRegression(max_iter=1000, class_weight='balanced', C=0.5))
-])
-pipeline_sup.fit(X_sup, y_sup)
-print("Supervised Model Trained.")
-
-# 4. Train PU Classifier (Pos vs Unlabeled Plays)
-print("\n--- Training PU Classifier (Pos vs Unlabeled) ---")
-# Build Unlabeled Pool
-play_windows = []
-play_meta = []
-exclude_titles = {"THE SONNETS", "A LOVER’S COMPLAINT", "THE PASSIONATE PILGRIM", "THE PHOENIX AND THE TURTLE", "THE RAPE OF LUCRECE", "VENUS AND ADONIS"}
-
+# 2. Clean 14-line windows from every play. play_meta line index = cleaned line index,
+#    the same index analyze_work / scan_work use, so overlays line up (bug 6).
+play_windows, play_meta = [], []
 for title, lines in works.items():
-    if title in exclude_titles: continue
-    clean_lines = [l.strip() for l in lines if l.strip()]
+    if title in NON_PLAY_TITLES:
+        continue
+    clean_lines = [t for t, _ in clean_play_lines(lines)[0]]
     for i in range(0, len(clean_lines) - 14 + 1):
-        block = clean_lines[i:i+14]
+        block = clean_lines[i:i + 14]
         play_windows.append("\n".join(block))
         play_meta.append((title, i, block[0]))
+print(f"{len(play_windows)} clean play windows.")
 
-# Subsample unlabeled
+def make_hard_negatives(n_samples, block_len=14, random_state=42):
+    """Non-overlapping-ish random play blocks (already cleaned)."""
+    rng = np.random.RandomState(random_state)
+    starts = [k for k, (_, i, _) in enumerate(play_meta) if i % (block_len // 2) == 0]
+    picks = rng.choice(starts, size=min(n_samples, len(starts)), replace=False)
+    return [play_windows[k] for k in picks]
+
+def build_model(use_tfidf=True, class_weight=None):
+    feats = [("structural", StructuralFeatures())]
+    if use_tfidf:
+        feats.insert(0, ("tfidf", TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_features=100)))
+    return Pipeline([
+        ("features", FeatureUnion(feats)),
+        ("scaler", StandardScaler(with_mean=False)),
+        ("clf", LogisticRegression(max_iter=1000, class_weight=class_weight, C=0.5)),
+    ])
+
+def heldout_proba(model, X, y):
+    return cross_val_predict(model, X, y, cv=CV, method="predict_proba")[:, 1]
+
+# 3. Supervised model (sonnets vs random play blocks): structural-only vs structural + TF-IDF
+print("\n--- Supervised Classifier: held-out ROC-AUC (5-fold CV) ---")
+hard_negatives = make_hard_negatives(len(all_positive_texts), random_state=123)
+X_sup = all_positive_texts + hard_negatives
+y_sup = np.array([1] * len(all_positive_texts) + [0] * len(hard_negatives))
+
+auc_sup = {}
+oof_sup = {}
+for use_tfidf in (False, True):
+    p = heldout_proba(build_model(use_tfidf, class_weight="balanced"), X_sup, y_sup)
+    oof_sup[use_tfidf] = p
+    auc_sup[use_tfidf] = roc_auc_score(y_sup, p)
+    print(f"  structural{' + TF-IDF' if use_tfidf else ' only'}: AUC = {auc_sup[use_tfidf]:.3f}")
+
+# Keep TF-IDF only if it adds real held-out signal after cleaning (method 2).
+# Override by setting USE_TFIDF = True/False yourself.
+USE_TFIDF = None
+if USE_TFIDF is None:
+    USE_TFIDF = (auc_sup[True] - auc_sup[False]) >= 0.01
+print(f"  -> USE_TFIDF = {USE_TFIDF}")
+sup_oof_scores = oof_sup[USE_TFIDF]          # held-out scores, used for the plots in cell 7
+
+pipeline_sup = build_model(USE_TFIDF, class_weight="balanced").fit(X_sup, y_sup)
+print("Supervised Model Trained.")
+
+# 4. PU classifier (sonnets = labeled, play windows = unlabeled)
+print("\n--- PU Classifier (Elkan & Noto) ---")
 rng = np.random.RandomState(123)
 n_unlabeled = 3000
-if len(play_windows) > n_unlabeled:
-    indices = rng.choice(len(play_windows), size=n_unlabeled, replace=False)
-    unlabeled_texts = [play_windows[i] for i in indices]
-else:
-    unlabeled_texts = play_windows
+idx_unl = rng.choice(len(play_windows), size=min(n_unlabeled, len(play_windows)), replace=False)
+unlabeled_texts = [play_windows[i] for i in idx_unl]
 
-y_pu = np.array([1] * len(all_positive_texts) + [0] * len(unlabeled_texts))
 X_pu = all_positive_texts + unlabeled_texts
+y_pu = np.array([1] * len(all_positive_texts) + [0] * len(unlabeled_texts))
 
-pipeline_pu = Pipeline([
-    ('features', FeatureUnion([
-        ('tfidf', TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_features=100)),
-        ('structural', StructuralFeatures(detector_wrapper))
-    ])),
-    ('scaler', StandardScaler(with_mean=False)),
-    ('clf', LogisticRegression(max_iter=1000, class_weight='balanced', C=0.5))
-])
-pipeline_pu.fit(X_pu, y_pu)
+# No class_weight: Elkan-Noto needs g(x) = P(labeled | x) to be a calibrated probability.
+g_oof = heldout_proba(build_model(USE_TFIDF, class_weight=None), X_pu, y_pu)
+c_pu = float(g_oof[y_pu == 1].mean())          # c = P(labeled | positive), from HELD-OUT positives
+print(f"  held-out AUC (labeled vs unlabeled) = {roc_auc_score(y_pu, g_oof):.3f}")
+print(f"  Estimated c (held-out) = {c_pu:.3f}   [first version, in-sample + balanced weights: 0.981]")
 
-# Estimate c
-probs_pos = pipeline_pu.predict_proba(all_positive_texts)[:, 1]
-c_pu = np.mean(probs_pos)
-print(f"PU Model Trained. Estimated c: {c_pu:.3f}")
+pipeline_pu = build_model(USE_TFIDF, class_weight=None).fit(X_pu, y_pu)
+
+def pu_probability(texts):
+    """P(sonnet | x) = g(x) / c, clipped to [0, 1]."""
+    return np.clip(pipeline_pu.predict_proba(texts)[:, 1] / c_pu, 0, 1)
+
+print("PU Model Trained.")
+print("Caveat: PU assumes labeled sonnets are a random sample of all sonnets. Play sonnets are")
+print("often 10-18 lines and split between speakers, so treat PU probabilities as a ranking.")
 
 
 # %% [markdown] id="P10qf1pxpFEL"
@@ -908,7 +1349,7 @@ The which if you with patient ears attend,
 What here shall miss, our toil shall strive to mend."""
 
 s_probs = pipeline_sup.predict_proba([friar_speech, prologue])[:, 1]
-p_probs = pipeline_pu.predict_proba([friar_speech, prologue])[:, 1] / c_pu
+p_probs = pu_probability([friar_speech, prologue])
 
 print(f"Supervised: Friar={s_probs[0]:.4f}, Prologue={s_probs[1]:.4f}")
 print(f"PU:         Friar={p_probs[0]:.4f}, Prologue={p_probs[1]:.4f}")
@@ -921,6 +1362,8 @@ meta_scan = play_meta
 
 print(f"Scanning {len(X_scan)} windows...")
 sup_scores = pipeline_sup.predict_proba(X_scan)[:, 1]
+# Ranking score: g(x)/c WITHOUT clipping. The first run clipped at 1, which (with c = 0.41)
+# turned the top of the PU list into ties at 1.0. Clipping is only for reading it as a probability.
 pu_scores = pipeline_pu.predict_proba(X_scan)[:, 1] / c_pu
 
 results = []
@@ -1055,8 +1498,9 @@ plt.figure(figsize=(15, 6))
 plt.subplot(1, 2, 1)
 sns.histplot(sup_scores, bins=50, color='skyblue', label='Plays (Supervised)', kde=True, stat="density")
 # Overlay Sonnet Scores
-sonnet_scores = pipeline_sup.predict_proba(all_positive_texts)[:, 1]
-sns.histplot(sonnet_scores, bins=20, color='orange', label='Canonical Sonnets', kde=True, stat="density", alpha=0.6)
+# Held-out (cross-validated) scores: in-sample scores would look better than the model really is
+sonnet_scores = sup_oof_scores[:len(all_positive_texts)]
+sns.histplot(sonnet_scores, bins=20, color='orange', label='Canonical Sonnets (held-out)', kde=True, stat="density", alpha=0.6)
 plt.axvline(sup_thresh, color='red', linestyle='--', label='Top 2% Threshold')
 plt.title('Score Distribution: Plays vs Sonnets (Supervised)')
 plt.xlabel('Sonnet Probability')
@@ -1083,199 +1527,228 @@ plt.show()
 # %% [markdown] id="V9rEbpzNfZ_g"
 # ## Define Sonnet Finder
 
-# %% id="iQ4vFglqKbki"
-from functools import lru_cache
-
 # %% id="5o3Sgi-N161X"
-# Cell 8: Detecting Sonnets
+# Cell 8: Detecting Sonnets (rule-based score)
 
 '''
-The final score (0.0 to 1.0) is a weighted sum of four distinct components.
-A score of 1.0 represents a mathematically perfect Shakespearean sonnet in this schema.
+The score (0.0 to 1.0) is a weighted sum of four components, each 0-1.
+Weights live in ONE place, WEIGHTS in cell 4, and every detector uses them:
+    meter 0.25 · syllables 0.15 · rhyme scheme 0.35 · couplet 0.25
+(The first version documented 25/15/35/25 here but used 15/15/40/30 in code,
+and the neural detector used 25/15/35/25, so their scores weren't comparable.)
 
-1. Meter Score (25%)
-Measures how well the rhythm matches iambic pentameter.
-
-For each of the 14 lines:
-We compare the line's stress pattern to the ideal 0-1-0-1-0-1...
-Score:
-Generate Notebook
-Note: Handles "feminine endings" (11 syllables) by ignoring the extra unstressed beat.
-Calculation: Average of all 14 line scores * 0.25
-
-2. Syllable Count Score (15%)
-Measures how close each line is to the required 10 syllables.
-
-For each of the 14 lines:
-Target: 10 Syllables (or 11 if feminine ending).
-Penalty: -0.1 for every syllable over or under the target.
-Score: 1.0 - (Distance * 0.1)
-Calculation: Average of all 14 line scores * 0.15
-
-3. Rhyme Scheme Score (35%)
-Measures the rhyme patterns of the first 12 lines (three quatrains).
-
-For each 4-line group (Quatrain):
-ABAB (Cross Rhyme) = 1.0 (Perfect)
-ABBA (Enclosed Rhyme) = 0.8
-AABB (Couplets) = 0.6
-AAAA (Monorhyme) = 0.5
-Partial (Half the rhymes work) = 0.2
-Calculation: Average of the 3 quatrain scores * 0.35
-
-4. Couplet Score (25%)
-Measures if the final two lines rhyme.
-
-For the final 2 lines:
-If they rhyme: Score = 1.0
-If they don't: Score = 0.0
-Calculation: (0 or 1) * 0.25
-
-
-5. Final Calculation:
-Total Score = (Meter * 0.25) + (Syllables * 0.15) + (Rhyme * 0.35) + (Couplet * 0.25)
-
+1. Meter: each line's stresses are aligned to iambic pentameter, allowing a
+   trochaic first foot and a feminine ending; monosyllabic function words are
+   unstressed and monosyllables are "flexible" (half cost if misplaced).
+2. Syllables: 1.0 for 10 syllables (or 11 with an unstressed ending), -0.1 per syllable off.
+3. Rhyme scheme: each quatrain of the body scores ABAB 1.0, ABBA 0.8, AABB 0.6,
+   one cross pair 0.2, multiplied by how well the pairs rhyme (perfect 1, weak 0.5).
+   Bodies that aren't exactly three quatrains are multiplied by 0.75.
+4. Couplet: rhyme level (1 / 0.5 / 0) of the last two lines.
 '''
-
 
 class SonnetDetector:
-    def __init__(self):
-        # Known Historical/Shakespearean Rhymes that fail phonetic checks
-        self.historical_rhymes = {
-            'love': ['move', 'prove'],
-            'move': ['love'],
-            'prove': ['love'],
-            'gone': ['alone', 'moan'],
-            'alone': ['gone'],
-            'moan': ['gone'],
-            'wind': ['mind', 'kind', 'find'],
-            'mind': ['wind'],
-            'kind': ['wind'],
-            'find': ['wind'],
-            'come': ['doom', 'tomb'],
-            'doom': ['come'],
-            'tomb': ['come'],
-            'heaven': ['even'],
-            'even': ['heaven'],
-            'great': ['defeat', 'seat'],
-            'defeat': ['great'],
-            'seat': ['great']
-        }
+    """Thin wrapper so older cells can keep calling detector.score_window / check_rhyme."""
+    def __init__(self, weights=None, mode="cmu"):
+        self.weights = weights            # None -> use the global WEIGHTS at call time
+        self.mode = mode
+        self.historical_rhymes = HISTORICAL_RHYMES
 
     def check_rhyme(self, word1, word2):
-        w1_lower = word1.lower()
-        w2_lower = word2.lower()
+        return check_rhyme(word1, word2, self.mode)
 
-        # 0. Historical / Hardcoded Dictionary
-        if w1_lower in self.historical_rhymes and w2_lower in self.historical_rhymes[w1_lower]:
-            return True
-
-        # 1. Exact/CMU check (Base)
-        r1 = get_rhyme_part(word1)
-        r2 = get_rhyme_part(word2)
-        if r1 and r2 and r1 == r2:
-            return True
-
-        # 2. Slant Rhyme / Approximate Matching
-        # Check last 2 characters (visual rhyme heuristic)
-        if len(word1) >= 2 and len(word2) >= 2 and word1[-2:] == word2[-2:]:
-            return True
-
-        # Check shared vowels (Assonance)
-        # Simplified: check if the last vowel character matches
-        w1_vowels = [c for c in word1 if c in 'aeiouy']
-        w2_vowels = [c for c in word2 if c in 'aeiouy']
-        if w1_vowels and w2_vowels and w1_vowels[-1] == w2_vowels[-1]:
-            return True
-
-        return False
+    def rhyme_level(self, word1, word2):
+        return rhyme_level(word1, word2, self.mode)
 
     def score_window(self, lines):
-        # Flexible scoring for variable length passages (e.g. 10, 11, 14, 15, 18 lines)
-        # Weights: Meter(15%), Syllable(15%), Rhyme(40%), Couplet(30%)
+        return score_window(lines, self.weights, self.mode)
 
-        if len(lines) < 8:
-            return 0.0
-
-        # 1. Meter & Syllable Score (15% + 15%)
-        # Average over all lines provided
-        meter_scores = []
-        syllable_scores = []
-
-        for line in lines:
-            pat = get_stress_pattern(line)
-
-            # Check for feminine ending (11 syllables, last unstressed)
-            if len(pat) == 11 and pat[-1] == 0:
-                meter_scores.append(is_iambic(pat[:-1]))
-                syllable_scores.append(1.0) # Treat 11-fem as perfect length
-            else:
-                meter_scores.append(is_iambic(pat))
-                # Syllable Count Score: 1.0 if 10, else penalty
-                dist = abs(len(pat) - 10)
-                syllable_scores.append(max(0, 1.0 - (dist * 0.1)))
-
-        avg_meter = np.mean(meter_scores) if meter_scores else 0.0
-        avg_syllable = np.mean(syllable_scores) if syllable_scores else 0.0
-
-        # 2. Rhyme Scheme Score (40%)
-        # We analyze the "body" of the poem (everything except the final couplet)
-        last_words = []
-        for line in lines:
-            words = re.findall(r"\w+", line)
-            if words:
-                last_words.append(words[-1])
-            else:
-                last_words.append("")
-
-        # Assume last 2 lines are the couplet, everything else is quatrains
-        body_lines = last_words[:-2] if len(lines) >= 2 else []
-        num_quatrains = len(body_lines) // 4
-        remainder = len(body_lines) % 4
-
-        quatrain_scores = []
-        for i in range(0, num_quatrains * 4, 4):
-            w = body_lines[i:i+4]
-            # Check patterns
-            is_cross = self.check_rhyme(w[0], w[2]) and self.check_rhyme(w[1], w[3])
-            is_enclosed = self.check_rhyme(w[0], w[3]) and self.check_rhyme(w[1], w[2])
-            is_couplets = self.check_rhyme(w[0], w[1]) and self.check_rhyme(w[2], w[3])
-            is_mono = self.check_rhyme(w[0], w[1]) and self.check_rhyme(w[1], w[2]) and self.check_rhyme(w[2], w[3])
-
-            if is_cross: val = 1.0
-            elif is_enclosed: val = 0.8
-            elif is_couplets: val = 0.6
-            elif is_mono: val = 0.5
-            elif self.check_rhyme(w[0], w[2]) or self.check_rhyme(w[1], w[3]): val = 0.2
-            else: val = 0.0
-            quatrain_scores.append(val)
-
-        # Average of however many quatrains we found
-        raw_rhyme_score = np.mean(quatrain_scores) if quatrain_scores else 0.0
-
-        # Apply penalty for non-standard structure (Ideal = 3 quatrains, 0 leftover lines)
-        # 3 quatrains + 0 remainder = 100%
-        # Anything else (2 or 4 quatrains, or extra lines like 11/15) = 75%
-        if num_quatrains == 3 and remainder == 0:
-            rhyme_multiplier = 1.0
-        else:
-            rhyme_multiplier = 0.75
-
-        rhyme_score = raw_rhyme_score * rhyme_multiplier
-
-        # 3. Couplet Score (30%)
-        # Always the last 2 lines
-        if len(lines) >= 2:
-            couplet_score = 1.0 if self.check_rhyme(last_words[-2], last_words[-1]) else 0.0
-        else:
-            couplet_score = 0.0
-
-        # Weighted Sum
-        # Meter: 0.15, Syllable: 0.15, Rhyme: 0.40, Couplet: 0.30
-        total_score = (avg_meter * 0.15) + (avg_syllable * 0.15) + (rhyme_score * 0.40) + (couplet_score * 0.30)
-        return total_score
+    def score_parts(self, lines):
+        return dict(zip(COMPONENTS, window_parts(lines, self.mode)))
 
 detector = SonnetDetector()
+print("Rule detector ready (weights from cell 4):", WEIGHTS)
+
+
+# %% [markdown]
+# ## Evaluate the Detectors on the 22 Known Play Sonnets
+#
+
+# %%
+# Cell 8b: Evaluate every detector against the 22 known play sonnets
+# -----------------------------------------------------------------------------
+# The question the whole notebook is asking is "does this detector find sonnets
+# hidden in plays?". We already know where 22 of them are, so we can measure it:
+#   recall@k    = share of known sonnets that appear among the top-k hits (after NMS)
+#   median rank = where a typical known sonnet lands in the ranked hit list
+# Every later change (weights, rhyme rules, classifier features) should be judged
+# by these numbers, on the TEST half of the known sonnets.
+# -----------------------------------------------------------------------------
+import difflib
+TOLERANCE = 3          # a hit within 3 lines of the true start counts (more for 16-18-line passages)
+EVAL_KS = (10, 25, 50, 100, 250)
+
+def locate_known_sonnets(works, specs, manual):
+    """Find each known sonnet's start line in the CLEANED lines of its play."""
+    plays = {t: clean_play_lines(l)[0] for t, l in works.items() if t not in NON_PLAY_TITLES}
+    rows = []
+    for spec in specs:
+        label = spec["label"]
+        first = manual[label][0] if label in manual else spec["first_line"]
+        key = _normalize_for_match(first)[:30]
+        hit = None
+        for title, cd in plays.items():
+            for i, (t, _) in enumerate(cd):
+                if _normalize_for_match(t).startswith(key):
+                    hit = (title, i)
+                    break
+            if hit:
+                break
+        if hit is None:
+            # Spelling differs between the edition the label came from and Gutenberg
+            # (e.g. "y-slackèd" vs "yslaked"): accept the closest line if it is >= 85% similar.
+            best = (0.0, None)
+            for title, cd in plays.items():
+                for i, (t, _) in enumerate(cd):
+                    r = difflib.SequenceMatcher(None, key, _normalize_for_match(t)[:30]).ratio()
+                    if r > best[0]:
+                        best = (r, (title, i))
+            if best[0] >= 0.85:
+                hit = best[1]
+        rows.append({"label": label, "play": hit[0] if hit else None,
+                     "line": hit[1] if hit else None,
+                     "n_lines": len(manual[label]) if label in manual else spec["num_lines"]})
+    return pd.DataFrame(rows)
+
+known_df = locate_known_sonnets(works, play_sonnet_specs, manual_play_sonnets)
+missing = known_df[known_df["play"].isna()]["label"].tolist()
+known_df = known_df.dropna(subset=["play"]).reset_index(drop=True)
+known_df["line"] = known_df["line"].astype(int)
+print(f"Located {len(known_df)} of {len(play_sonnet_specs)} known play sonnets in the cleaned plays.")
+if missing:
+    print("Not in the corpus (cannot be recalled):", missing)
+
+# Fixed tune / test split so weights are never chosen on the sonnets used to report results
+_rng = np.random.RandomState(0)
+_perm = _rng.permutation(len(known_df))
+known_df["split"] = "test"
+known_df.loc[_perm[: len(known_df) // 2], "split"] = "tune"
+print(known_df[["label", "play", "line", "split"]].to_string(index=False))
+
+def ranked_hits(score_by_play, radius=NMS_RADIUS):
+    """Pool NMS peaks from every play into one ranked list [(play, line, score)]."""
+    hits = []
+    for play, sc in score_by_play.items():
+        sc = np.asarray(sc)
+        for idx in nms_top_k(sc, k=None, radius=radius):
+            hits.append((float(sc[idx]), play, idx))
+    hits.sort(key=lambda h: -h[0])
+    return [(p, i, s) for s, p, i in hits]
+
+def known_ranks(hits, known, tol=TOLERANCE):
+    """1-based rank of the first hit matching each known sonnet (inf if never hit)."""
+    ranks = []
+    for _, row in known.iterrows():
+        slack = max(tol, int(row["n_lines"]) - 12)     # longer passages (15-18 lines) can peak a few lines in
+        r = next((k + 1 for k, (p, i, _) in enumerate(hits)
+                  if p == row["play"] and abs(i - row["line"]) <= slack), np.inf)
+        ranks.append(r)
+    return np.array(ranks, dtype=float)
+
+def evaluate(score_by_play, known, name, ks=EVAL_KS):
+    hits = ranked_hits(score_by_play)
+    ranks = known_ranks(hits, known)
+    row = {"detector": name, "n_known": len(known), "median_rank": float(np.median(ranks))}
+    for k in ks:
+        row[f"recall@{k}"] = float(np.mean(ranks <= k))
+    return row, ranks
+
+# --- 1. Rule-based detector (shared toolkit, WEIGHTS) ------------------------
+play_titles = [t for t in works if t not in NON_PLAY_TITLES]
+print(f"\nScanning {len(play_titles)} plays with the rule detector (cached after the first run)...")
+rule_scans = {t: scan_work(t, works[t]) for t in tqdm(play_titles, desc="rule scan")}
+
+def rule_scores(weights=None):
+    return {t: scores_from_scan(s, weights)[0] for t, s in rule_scans.items()}
+
+# --- 2. Classifiers (from cell 7; their window index = cleaned line index) --
+def classifier_scores(col):
+    out = {}
+    for t in play_titles:
+        n = len(rule_scans[t]["clean_data"])
+        arr = np.zeros(n)
+        sub = df[df["play"] == t]
+        arr[sub["line"].values] = sub[col].values
+        out[t] = arr
+    return out
+
+results, rank_table = [], {}
+for name, sbp in [("rule (WEIGHTS)", rule_scores()),
+                  ("supervised clf", classifier_scores("sup")),
+                  ("PU clf", classifier_scores("pu"))]:
+    for split in ("tune", "test"):
+        row, ranks = evaluate(sbp, known_df[known_df["split"] == split], name)
+        row["split"] = split
+        results.append(row)
+    rank_table[name] = known_ranks(ranked_hits(sbp), known_df)
+
+eval_df = pd.DataFrame(results)
+print("\n=== Baseline: how well does each detector find the known play sonnets? ===")
+print(eval_df.round(3).to_string(index=False))
+
+# How much would these numbers move with a different handful of known sonnets?
+# Bootstrap over the known sonnets (all of them, both halves) -> 95% intervals.
+def bootstrap_ci(ranks, k=50, n_boot=5000, seed=0):
+    rng = np.random.default_rng(seed)
+    ranks = np.asarray(ranks, float)
+    idx = rng.integers(0, len(ranks), size=(n_boot, len(ranks)))
+    rec = (ranks[idx] <= k).mean(axis=1)
+    med = np.median(ranks[idx], axis=1)
+    return (np.quantile(rec, [0.025, 0.975], method="nearest"),
+            np.quantile(med, [0.025, 0.975], method="nearest"))   # "nearest" keeps inf (never found) usable
+
+print(f"\n95% bootstrap intervals over all {len(known_df)} located sonnets:")
+for name, r in rank_table.items():
+    (rl, rh), (ml, mh) = bootstrap_ci(r)
+    print(f"  {name:16s} recall@50 = {np.mean(r <= 50):.2f}  [{rl:.2f}, {rh:.2f}]   "
+          f"median rank = {np.median(r):.0f}  [{ml:.0f}, {mh:.0f}]")
+print("Intervals this wide mean a difference of one or two sonnets is not a real difference.")
+
+per_sonnet = known_df[["label", "split"]].copy()
+for name, r in rank_table.items():
+    per_sonnet[name] = r
+print("\nRank of each known sonnet (lower is better; inf = never in the hit list):")
+print(per_sonnet.to_string(index=False))
+
+# --- 3. Tune rule weights on the TUNE half only, report on TEST -------------
+def tune_weights(step=0.1, metric="recall@50"):
+    grid = np.round(np.arange(0, 1 + 1e-9, step), 3)
+    tune_known = known_df[known_df["split"] == "tune"]
+    best = None
+    for wm in grid:
+        for ws in grid:
+            for wr in grid:
+                wc = round(1 - wm - ws - wr, 3)
+                if wc < -1e-9:
+                    continue
+                w = dict(zip(COMPONENTS, (wm, ws, wr, wc)))
+                row, ranks = evaluate(rule_scores(w), tune_known, "grid")
+                key = (row[metric], -row["median_rank"])
+                if best is None or key > best[0]:
+                    best = (key, w)
+    return best[1]
+
+RUN_WEIGHT_TUNING = True    # ~1-2 min; set False to skip
+if RUN_WEIGHT_TUNING:
+    tuned = tune_weights()
+    print("\nTuned weights (chosen on the tune half):", tuned)
+    for split in ("tune", "test"):
+        before, _ = evaluate(rule_scores(WEIGHTS), known_df[known_df["split"] == split], "rule (WEIGHTS)")
+        after, _ = evaluate(rule_scores(tuned), known_df[known_df["split"] == split], "rule (tuned)")
+        print(f"  {split}: recall@50 {before['recall@50']:.2f} -> {after['recall@50']:.2f}; "
+              f"median rank {before['median_rank']:.0f} -> {after['median_rank']:.0f}")
+    print("If the TEST numbers improve, copy the tuned weights into WEIGHTS in cell 4 and re-run.")
+
 
 # %% [markdown] id="Fu0mylRVfoae"
 # ## Analyze Sonnets Specifically
@@ -1333,79 +1806,7 @@ PLAY_ABBREVIATIONS = {
     "VENUS AND ADONIS": "Venus"
 }
 
-# --- 1. Date Categorization ---
-def get_sonnet_date(num):
-    if 1 <= num <= 60: return 1596
-    elif 61 <= num <= 77: return 1594.5
-    elif 78 <= num <= 86: return 1599
-    elif 87 <= num <= 103: return 1594.5
-    elif 104 <= num <= 126: return 1602
-    elif 127 <= num <= 144: return 1593
-    elif num == 145: return 1582
-    elif 146 <= num <= 154: return 1593
-    return None
-
-
-
-
-def analyze_work(title, lines):
-    print(f"Analyzing {title}...")
-    scores = []
-    # We now scan with multiple window sizes to find the best fit
-    window_sizes = [10, 11, 14, 15, 18]
-    max_window = max(window_sizes)
-
-    clean_data = [] # List of tuples: (text, speaker)
-    boundaries = [] # (index, label, type)
-
-    current_clean_idx = 0
-    current_speaker = "UNKNOWN"
-
-    for line in lines:
-        s_line = line.strip()
-        if not s_line:
-            continue
-
-        # Check boundaries
-        if s_line.upper().startswith("ACT "):
-            label = s_line.split('.')[0]
-            boundaries.append((current_clean_idx, label, 'act'))
-            continue
-        if s_line.upper().startswith("SCENE "):
-            label = s_line.split('.')[0]
-            boundaries.append((current_clean_idx, label, 'scene'))
-            continue
-
-        # Check Speaker
-        if (
-            s_line.isupper() and s_line.endswith(".") and len(s_line) < 20 and
-            "SCENE" not in s_line and "ACT" not in s_line
-        ):
-            current_speaker = s_line.strip(".")
-            continue
-
-        if len(s_line) > 10:
-            clean_data.append((s_line, current_speaker))
-            current_clean_idx += 1
-
-    # Extract just text for scoring
-    clean_lines_text = [x[0] for x in clean_data]
-
-    # Scan each position
-    for i in range(len(clean_lines_text)):
-        best_score_for_pos = 0.0
-
-        for w_size in window_sizes:
-            if i + w_size <= len(clean_lines_text):
-                window = clean_lines_text[i : i + w_size]
-                # Use updated detector.score_window (now flexible)
-                score = detector.score_window(window)
-                if score > best_score_for_pos:
-                    best_score_for_pos = score
-
-        scores.append(best_score_for_pos)
-
-    return scores, clean_data, boundaries
+# get_sonnet_date and analyze_work now come from the shared toolkit (cell 4).
 
 # Analyze
 lines = works[WORK_TO_ANALYZE]
@@ -1427,28 +1828,8 @@ for idx, label, b_type in boundaries:
         plt.axvline(x=idx, color='black', linewidth=0.05)
         plt.text(idx, 0.15, label, rotation=90, fontsize=6, verticalalignment='bottom')
 
-# 2. Top 10 Markers via NMS
-scores_array = np.array(scores)
-sorted_indices = scores_array.argsort()[::-1]
-
-nms_indices = []
-taken_mask = np.zeros(len(scores), dtype=bool)
-window_size = 14
-
-for idx in sorted_indices:
-    if len(nms_indices) >= 10:
-        break
-    if taken_mask[idx]:
-        continue
-
-    nms_indices.append(idx)
-
-    # Mark neighbors as taken (use max window size 18 to be safe)
-    start = max(0, idx - 18 + 1)
-    end = min(len(scores), idx + 18)
-    taken_mask[start:end] = True
-
-top_indices = nms_indices
+# 2. Top 10 Markers via NMS (shared function)
+top_indices = nms_top_k(scores, k=10)
 
 # Plot markers for these top NMS hits
 for idx in top_indices:
@@ -1468,8 +1849,7 @@ for i, idx in enumerate(top_indices):
     print("-" * 20)
 
     last_speaker = None
-    for j in range(idx, idx+14):
-        line_text, speaker = clean_data[j]
+    for line_text, speaker in clean_data[idx: idx + 14]:     # clipped at the end of the work
 
         prefix = ""
         if speaker != last_speaker:
@@ -1482,36 +1862,8 @@ for i, idx in enumerate(top_indices):
 # REMOVED IF CONDITION: Always run this
 print("\nGenerating Sonnet Scatter Plot (Including Play Sonnets)...")
 
-# Parse individual sonnets (Quick re-parse for this visualization)
-sonnets_map = {}
-current_sonnet = []
-current_num = 0
-roman_re = re.compile(r'^[XVI]+(\.)?$')
-
-for line in lines:
-    s_line = line.strip()
-    if not s_line:
-        continue
-
-    # Check for header (Roman numeral or digit)
-    is_header = False
-    if s_line.isdigit():
-        is_header = True
-    elif roman_re.match(s_line):
-        is_header = True
-
-    if is_header:
-        if current_sonnet and len(current_sonnet) >= 10:
-            sonnets_map[current_num] = current_sonnet
-        current_sonnet = []
-        try:
-            current_num = int(s_line.strip('.'))
-        except:
-            current_num += 1
-    else:
-        current_sonnet.append(s_line)
-if current_sonnet:
-    sonnets_map[current_num] = current_sonnet
+# Parse individual sonnets (shared parser)
+sonnets_map = parse_sonnets_map(works)
 
 # Score each sonnet
 sonnet_scores = []
@@ -1581,7 +1933,7 @@ for line in play_sonnet_lines:
             current_label = match.group(1)
         else:
             current_label = "Unknown"
-    elif line.strip():
+    elif line.strip() and not _SPEAKER_RE.match(line.strip().translate(_APOS)):   # skip speaker tags
         current_play_sonnet.append(line)
 
 # Process last one
@@ -1633,13 +1985,7 @@ def classify_rhyme_scheme_with_example(lines):
     if len(lines) < 12:
         return "Unknown", None
 
-    last_words = []
-    for line in lines:
-        words = re.findall(r"\w+", line)
-        if words:
-            last_words.append(words[-1])
-        else:
-            last_words.append("")
+    last_words = [end_word(line) for line in lines]
 
     quatrain_types = []
     deviant_examples = {"Enclosed": None, "Couplets": None, "Irregular": None}
@@ -1769,7 +2115,7 @@ def analyze_vocabulary_refined(sonnets_map):
     for lines in sonnets_map.values():
         all_text += " ".join(lines) + " "
 
-    words = re.findall(r"\w+", all_text.lower())
+    words = [w.lower() for w in tokenize_words(all_text)]
     counts = Counter(words)
 
     words_1x = sorted([w for w, c in counts.items() if c == 1])
@@ -1831,7 +2177,7 @@ def build_rare_word_matrix(sonnets_map, min_df=2, max_df=12):
 
     for num in sonnet_nums:
         text = " ".join(sonnets_map[num])
-        words = re.findall(r"\w+", text.lower())
+        words = [w.lower() for w in tokenize_words(text)]
         wset = set(words)
         sonnet_word_sets[num] = wset
         for w in wset:
@@ -2308,6 +2654,8 @@ def compare_cluster_word_structures(word_lists_dict):
             plt.show()
 
 
+# TODO (method 5): ARI between methods is chance-level; add silhouette scores or
+# bootstrap stability across k before interpreting these clusters.
 def cluster_sonnets_by_rare_words(sonnets_map, n_clusters=6):
     """
     Run three clustering methods on rare-word usage:
@@ -2386,254 +2734,7 @@ else:
     print("Error: 'sonnets_map' not found. Please run previous cells first.")
 
 
-# --- FINAL COMBINED PCA: temporal metrics + LSA themes + rare-word Ward clusters ---
-
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA, TruncatedSVD
-from sklearn.cluster import AgglomerativeClustering
-from matplotlib.lines import Line2D
-from scipy.spatial import ConvexHull
-
-def combined_pca_temporal_and_rare_clusters(df_temporal, sonnets_map, n_clusters=6):
-    """
-    Build a combined feature space using:
-      - Temporal metrics: Score, RhymeDiversity, NounRatio, VerbRatio, AdjRatio
-      - LSA theme components: Theme_* columns from df_temporal
-      - Rare-word structure:
-          * TruncatedSVD components from the rare-word (2–12 DF) matrix
-          * Agglomerative (Ward) clusters on rare-word usage (encoded as one-hot)
-
-    Then run a PCA and plot PC1 vs PC2:
-      - Color by composition date (viridis)
-      - Marker shape by rare-word Ward cluster
-      - Convex hull per cluster
-
-    Finally, print a textual characterization of each cluster.
-    """
-    # --- 1. Rare-word matrix & Ward clustering ---
-    sonnet_nums_rw, rare_words_rw, X_rw = build_rare_word_matrix(sonnets_map, min_df=2, max_df=12)
-
-    # Agglomerative (Ward) on rare-word usage
-    agg = AgglomerativeClustering(n_clusters=n_clusters, linkage='ward')
-    labels_agg = agg.fit_predict(X_rw)
-
-    # Some low-rank representation of the rare-word matrix
-    if X_rw.shape[1] > 1:
-        n_rw_comps = min(5, X_rw.shape[1] - 1, X_rw.shape[0] - 1)
-        if n_rw_comps < 1:
-            n_rw_comps = 1
-    else:
-        n_rw_comps = 1
-
-    svd_rw = TruncatedSVD(n_components=n_rw_comps, random_state=42)
-    X_rw_svd = svd_rw.fit_transform(X_rw)  # shape: (n_sonnets, n_rw_comps)
-
-    # Build a DF of rare-word features keyed by sonnet number
-    df_rw = pd.DataFrame({
-        "Num": sonnet_nums_rw,
-        "RareCluster": labels_agg
-    })
-    for i in range(n_rw_comps):
-        df_rw[f"RareLSA_{i+1}"] = X_rw_svd[:, i]
-
-    # --- 2. Merge with temporal / theme features from df_temporal ---
-    # df_temporal has columns: Num, Date, Score, RhymeDiversity, NounRatio, VerbRatio, AdjRatio, Theme_...
-    df_combined = pd.merge(df_temporal, df_rw, on="Num", how="inner")
-
-    # Identify theme columns
-    theme_cols = [c for c in df_combined.columns if c.startswith("Theme_")]
-
-    # Base metrics
-    base_features = ['Score', 'RhymeDiversity', 'NounRatio', 'VerbRatio', 'AdjRatio']
-
-    # Rare-word SVD features
-    rare_lsa_cols = [f"RareLSA_{i+1}" for i in range(n_rw_comps)]
-
-    # One-hot encode cluster labels
-    rare_cluster_dummies = pd.get_dummies(df_combined['RareCluster'], prefix='RareC')
-
-    # Build final feature matrix
-    feature_cols = base_features + theme_cols + rare_lsa_cols
-    X_base = df_combined[feature_cols].values
-    X_full = np.hstack([X_base, rare_cluster_dummies.values])
-
-    # --- 3. Standardize & PCA ---
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_full)
-
-    pca = PCA(n_components=2, random_state=42)
-    X_pca = pca.fit_transform(X_scaled)
-
-    df_combined['PC_comb1'] = X_pca[:, 0]
-    df_combined['PC_comb2'] = X_pca[:, 1]
-
-    # --- 4. Plot: PC1 vs PC2 with viridis colors by date & shapes by Ward cluster ---
-    df_combined['DateLabel'] = df_combined['Date'].astype(str)
-    unique_labels = sorted(df_combined['DateLabel'].unique(), key=lambda x: float(x))
-
-    palette_colors = sns.color_palette("viridis", n_colors=len(unique_labels))
-    palette_dict = {label: color for label, color in zip(unique_labels, palette_colors)}
-
-    markers = ['o', 's', '^', 'D', 'P', 'X', '*', 'v']
-
-    plt.figure(figsize=(12, 8))
-    ax = plt.gca()
-
-    # Convex hull per Ward cluster (faint, black outline)
-    for cid in sorted(df_combined['RareCluster'].unique()):
-        pts = df_combined[df_combined['RareCluster'] == cid][['PC_comb1', 'PC_comb2']].values
-        if len(pts) < 3:
-            continue
-        try:
-            hull = ConvexHull(pts)
-            hull_pts = pts[hull.vertices]
-            ax.fill(
-                hull_pts[:, 0],
-                hull_pts[:, 1],
-                facecolor='lightgray',
-                edgecolor='black',
-                alpha=0.15,
-                linewidth=0.15
-            )
-        except Exception:
-            # Degenerate cases: skip hull
-            pass
-
-    # Plot points
-    for _, row in df_combined.iterrows():
-        x, y = row['PC_comb1'], row['PC_comb2']
-        date_label = row['DateLabel']
-        color = palette_dict[date_label]
-        c_id = int(row['RareCluster'])
-        marker = markers[c_id % len(markers)]
-
-        ax.scatter(
-            x, y,
-            c=[color],
-            marker=marker,
-            edgecolors='black',
-            s=70,
-            alpha=0.9
-        )
-        ax.text(
-            x + 0.02,
-            y + 0.02,
-            str(int(row['Num'])),
-            fontsize=7
-        )
-
-    # Legends: date (color) and Ward cluster (shape)
-    date_handles = [
-        Line2D(
-            [0], [0],
-            marker='o', color='w',
-            label=lab,
-            markerfacecolor=palette_dict[lab],
-            markersize=8
-        )
-        for lab in unique_labels
-    ]
-
-    cluster_ids = sorted(df_combined['RareCluster'].unique())
-    cluster_handles = [
-        Line2D(
-            [0], [0],
-            marker=markers[c % len(markers)],
-            color='k',
-            linestyle='None',
-            label=f"RareC {c}"
-        )
-        for c in cluster_ids
-    ]
-
-    leg1 = ax.legend(
-        handles=date_handles,
-        title="Hypothesized Date",
-        loc='upper left'
-    )
-    ax.add_artist(leg1)
-
-    ax.legend(
-        handles=cluster_handles,
-        title="Ward Rare-word Cluster",
-        loc='lower left'
-    )
-
-    ax.set_title(
-        "Combined PCA: temporal metrics + LSA themes + rare-word Ward clusters"
-    )
-    ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.2%} var)")
-    ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.2%} var)")
-    ax.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.show()
-
-    # --- 5. Textual characterization of each cluster ---
-    print("\n" + "="*70)
-    print("CLUSTER CHARACTERIZATION (Agglomerative Ward on rare words)")
-    print("="*70)
-
-    # Map from sonnet number -> row index in X_rw, so we can align clusters with X_rw
-    num_to_idx_rw = {num: idx for idx, num in enumerate(sonnet_nums_rw)}
-
-    for cid in cluster_ids:
-        df_c = df_combined[df_combined['RareCluster'] == cid]
-        n_c = len(df_c)
-
-        print(f"\n--- Cluster {cid} ---")
-        print(f"Number of sonnets: {n_c}")
-
-        if n_c == 0:
-            print("  (Empty cluster)")
-            continue
-
-        # 5a) Average temporal metrics
-        avg_metrics = {feat: df_c[feat].mean() for feat in base_features}
-        metrics_str = ", ".join(f"{k}={v:.3f}" for k, v in avg_metrics.items())
-        print(f"  Avg metrics: {metrics_str}")
-
-        # 5b) Dominant themes (by absolute mean loading)
-        if theme_cols:
-            theme_means = df_c[theme_cols].mean(axis=0)
-            theme_rank = theme_means.abs().sort_values(ascending=False)
-            top_themes = theme_rank.index[:3].tolist()
-            print("  Dominant themes:", ", ".join(top_themes))
-        else:
-            print("  Dominant themes: (none; no Theme_ columns found)")
-
-        # 5c) Top rare words defining this cluster
-        # Find indices in the rare-word matrix for sonnets in this cluster
-        idxs_rw = [
-            num_to_idx_rw[num]
-            for num in df_c['Num'].tolist()
-            if num in num_to_idx_rw
-        ]
-        if idxs_rw:
-            subX = X_rw[idxs_rw, :]
-            word_counts = np.asarray(subX.sum(axis=0)).ravel()
-            order = np.argsort(word_counts)[::-1]
-            top_n = 20
-            top_words = [
-                rare_words_rw[i]
-                for i in order[:top_n]
-                if word_counts[i] > 0
-            ]
-            print("  Top rare words:", ", ".join(top_words))
-        else:
-            print("  Top rare words: (no alignment with rare-word matrix)")
-
-    print("\n(End of cluster characterization.)")
-
-
-# --- EXECUTE FINAL COMBINED PCA ---
-# Requires:
-#   - df_temporal from your temporal/LSA cell
-#   - sonnets_map (already built in this notebook)
-if 'df_temporal' in locals() and 'sonnets_map' in locals():
-    combined_pca_temporal_and_rare_clusters(df_temporal, sonnets_map, n_clusters=6)
-else:
-    print("Note: df_temporal or sonnets_map not found. "
-          "Please run the temporal feature cell (extract_sonnet_features + analyze_and_visualize) first.")
+# (The combined PCA that used df_temporal now runs in its own cell after the temporal analysis.)
 
 
 # %% [markdown] id="dn1gOmx2fd7V"
@@ -2670,58 +2771,8 @@ else:
 # Configuration
 WORK_TO_ANALYZE = "A MIDSUMMER NIGHT’S DREAM"
 
-def analyze_work(title, lines):
-    print(f"Analyzing {title}...")
-    scores = []
-    # Multi-window scanning for variable length sonnets
-    window_sizes = [10, 11, 14, 15, 18]
-
-    clean_data = [] # List of tuples: (text, speaker)
-    boundaries = [] # (index, label, type)
-
-    current_clean_idx = 0
-    current_speaker = "UNKNOWN"
-
-    for line in lines:
-        s_line = line.strip()
-        if not s_line: continue
-
-        # Check boundaries
-        if s_line.upper().startswith("ACT "):
-            label = s_line.split('.')[0]
-            boundaries.append((current_clean_idx, label, 'act'))
-            continue
-        if s_line.upper().startswith("SCENE "):
-            label = s_line.split('.')[0]
-            boundaries.append((current_clean_idx, label, 'scene'))
-            continue
-
-        # Check Speaker
-        if s_line.isupper() and s_line.endswith(".") and len(s_line) < 20 and "SCENE" not in s_line and "ACT" not in s_line:
-            current_speaker = s_line.strip(".")
-            continue
-
-        if len(s_line) > 10:
-            clean_data.append((s_line, current_speaker))
-            current_clean_idx += 1
-
-    # Extract just text for scoring
-    clean_lines_text = [x[0] for x in clean_data]
-
-    # Scan each position with multiple window sizes
-    for i in range(len(clean_lines_text)):
-        best_score_for_pos = 0.0
-
-        for w_size in window_sizes:
-            if i + w_size <= len(clean_lines_text):
-                window = clean_lines_text[i : i + w_size]
-                score = detector.score_window(window)
-                if score > best_score_for_pos:
-                    best_score_for_pos = score
-
-        scores.append(best_score_for_pos)
-
-    return scores, clean_data, boundaries
+# analyze_work comes from the shared toolkit (cell 4): same cleaner as the classifiers,
+# so the classifier overlay bars below now point at the right lines.
 
 # Analyze
 lines = works[WORK_TO_ANALYZE]
@@ -2779,26 +2830,7 @@ for idx, label, b_type in boundaries:
         plt.text(idx, 0.08, label, rotation=90, fontsize=6, verticalalignment='bottom') # Lower for Scene
 
 # 2. Top 10 Markers (With NMS)
-scores_array = np.array(scores)
-sorted_indices = scores_array.argsort()[::-1]
-
-# NMS Logic (Window 18)
-nms_indices = []
-taken_mask = np.zeros(len(scores), dtype=bool)
-nms_window = 18
-
-for idx in sorted_indices:
-    if len(nms_indices) >= 20:
-        break
-    if taken_mask[idx]:
-        continue
-
-    nms_indices.append(idx)
-    start = max(0, idx - nms_window + 1)
-    end = min(len(scores), idx + nms_window)
-    taken_mask[start:end] = True
-
-top_indices = nms_indices
+top_indices = nms_top_k(scores, k=20)
 
 # Plot markers
 for idx in top_indices:
@@ -2818,8 +2850,7 @@ for i, idx in enumerate(top_indices):
     print("-" * 20)
     # Print 14 lines context (or up to 18?) - Let's print 14 as standard view
     last_speaker = None
-    for j in range(idx, min(idx+14, len(clean_data))):
-        line_text, speaker = clean_data[j]
+    for line_text, speaker in clean_data[idx: idx + 14]:
         prefix = ""
         if speaker != last_speaker:
             prefix = f"[{speaker}] "
@@ -2830,30 +2861,7 @@ for i, idx in enumerate(top_indices):
 if WORK_TO_ANALYZE == "THE SONNETS":
     print("\nGenerating Ranked Sonnet Graph...")
 
-    # Parse individual sonnets (Quick re-parse for this visualization)
-    sonnets_map = {}
-    current_sonnet = []
-    current_num = 0
-    roman_re = re.compile(r'^[XVI]+(\.)?$')
-
-    for line in lines:
-        s_line = line.strip()
-        if not s_line: continue
-
-        # Check for header (Roman numeral or digit)
-        is_header = False
-        if s_line.isdigit(): is_header = True
-        elif roman_re.match(s_line): is_header = True
-
-        if is_header:
-            if current_sonnet and len(current_sonnet) >= 10:
-                sonnets_map[current_num] = current_sonnet
-            current_sonnet = []
-            try: current_num = int(s_line.strip('.'))
-            except: current_num += 1
-        else:
-            current_sonnet.append(s_line)
-    if current_sonnet: sonnets_map[current_num] = current_sonnet
+    sonnets_map = parse_sonnets_map(works)
 
     # Score each sonnet
     sonnet_scores = []
@@ -2921,6 +2929,8 @@ plt.figure(figsize=(14, 8))
 power_smooth = gaussian_filter(power, sigma=(2, 2))
 
 # Significance Threshold (White Noise Model)
+# TODO (method 5): overlapping windows make this signal red noise; replace with an
+# AR(1) null spectrum (Torrence & Compo 1998) before trusting these contours.
 variance = np.var(sig)
 significance_threshold = variance * (stats.chi2.ppf(0.95, 2) / 2)
 
@@ -2944,7 +2954,7 @@ plt.show()
 
 # --- Rare Word Analysis ---
 def tokenize(text):
-    return re.findall(r"\w+", text.lower())
+    return [w.lower() for w in tokenize_words(text)]   # keeps sister's whole
 
 all_text = " ".join([line_text for (line_text, speaker) in clean_data])
 all_tokens = tokenize(all_text)
@@ -2973,6 +2983,8 @@ plt.show()
 print(f"\nTotal unique word types in {WORK_TO_ANALYZE}: {len(word_counts)}")
 
 # Test Groups
+# TODO (method 5): lines within one window aren't independent; use per-window rates or a
+# permutation test that shuffles whole windows instead of the t-test below.
 n_lines = len(clean_data)
 poetic_indices = set()
 for idx in top_indices:
@@ -3051,35 +3063,10 @@ print("\nGenerating Score Distribution Comparison...")
 all_sonnet_scores = []
 
 # Canonical
-sonnets_text = works.get("THE SONNETS", [])
-s_map = {}
-curr_s = []
-curr_n = 0
-for l in sonnets_text:
-    if l.strip().isdigit() or re.match(r'^[XVI]+(\.)?$', l.strip()):
-        if curr_s and len(curr_s)>=10: s_map[curr_n] = curr_s
-        curr_s = []
-        try: curr_n = int(l.strip('.'))
-        except: curr_n += 1
-    else:
-        curr_s.append(l)
-if curr_s: s_map[curr_n] = curr_s
-
-for s_lines in s_map.values():
-    if len(s_lines) >= 8:
-        all_sonnet_scores.append(detector.score_window(s_lines))
-
-# Play Sonnets
-if "PLAY SONNETS" in works:
-    ps_lines = works["PLAY SONNETS"]
-    curr_ps = []
-    for l in ps_lines:
-        if l.startswith("=== PLAY SONNET"):
-            if curr_ps: all_sonnet_scores.append(detector.score_window(curr_ps))
-            curr_ps = []
-        elif l.strip():
-            curr_ps.append(l)
-    if curr_ps: all_sonnet_scores.append(detector.score_window(curr_ps))
+for s_lines in parse_sonnets_map(works).values():
+    all_sonnet_scores.append(detector.score_window(s_lines))
+for _, ps in parse_play_sonnets(works):
+    all_sonnet_scores.append(detector.score_window(ps))
 
 # 2. Plot Overlapping KDEs (Density)
 plt.figure(figsize=(12, 6))
@@ -3112,7 +3099,7 @@ def grouped_bar_chart_dualaxis(values_list, labels, title, ylabel_left, ylabel_r
     width = 0.15
 
     # color map
-    cmap = plt.cm.get_cmap("viridis", n_works)
+    cmap = plt.get_cmap("viridis", n_works)
     colors = [cmap(i) for i in range(n_works)]
 
     # offsets for grouped bars
@@ -3242,17 +3229,7 @@ try:
 except:
     pass
 
-# --- 1. Date Categorization ---
-def get_sonnet_date(num):
-    if 1 <= num <= 60: return 1596
-    elif 61 <= num <= 77: return 1594.5
-    elif 78 <= num <= 86: return 1599
-    elif 87 <= num <= 103: return 1594.5
-    elif 104 <= num <= 126: return 1602
-    elif 127 <= num <= 144: return 1593
-    elif num == 145: return 1582
-    elif 146 <= num <= 154: return 1593
-    return None
+# get_sonnet_date comes from the shared toolkit (cell 4).
 
 # --- 2. Feature Extraction ---
 def extract_sonnet_features(sonnets_map, detector):
@@ -3275,10 +3252,7 @@ def extract_sonnet_features(sonnets_map, detector):
         score = detector.score_window(lines[:14])
 
         # C. Rhyme Scheme Diversity
-        last_words = []
-        for line in lines[:14]:
-            words = re.findall(r"\w+", line)
-            last_words.append(words[-1] if words else "")
+        last_words = [end_word(line) for line in lines[:14]]
 
         q_types = []
         for i in range(0, 12, 4):
@@ -3614,6 +3588,262 @@ if 'sonnets_map' in locals() and 'detector' in locals():
 else:
     print("Error: 'sonnets_map' or 'detector' not found. Please run previous cells first.")
 
+# %% [markdown]
+# ## Combined PCA: Temporal Metrics + Themes + Rare-Word Clusters
+#
+
+# %%
+# Moved here from cell 9 (bug 7): it needs df_temporal, which the cell above creates.
+# --- FINAL COMBINED PCA: temporal metrics + LSA themes + rare-word Ward clusters ---
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.cluster import AgglomerativeClustering
+from matplotlib.lines import Line2D
+from scipy.spatial import ConvexHull
+
+def combined_pca_temporal_and_rare_clusters(df_temporal, sonnets_map, n_clusters=6):
+    """
+    Build a combined feature space using:
+      - Temporal metrics: Score, RhymeDiversity, NounRatio, VerbRatio, AdjRatio
+      - LSA theme components: Theme_* columns from df_temporal
+      - Rare-word structure:
+          * TruncatedSVD components from the rare-word (2–12 DF) matrix
+          * Agglomerative (Ward) clusters on rare-word usage (encoded as one-hot)
+
+    Then run a PCA and plot PC1 vs PC2:
+      - Color by composition date (viridis)
+      - Marker shape by rare-word Ward cluster
+      - Convex hull per cluster
+
+    Finally, print a textual characterization of each cluster.
+    """
+    # --- 1. Rare-word matrix & Ward clustering ---
+    sonnet_nums_rw, rare_words_rw, X_rw = build_rare_word_matrix(sonnets_map, min_df=2, max_df=12)
+
+    # Agglomerative (Ward) on rare-word usage
+    agg = AgglomerativeClustering(n_clusters=n_clusters, linkage='ward')
+    labels_agg = agg.fit_predict(X_rw)
+
+    # Some low-rank representation of the rare-word matrix
+    if X_rw.shape[1] > 1:
+        n_rw_comps = min(5, X_rw.shape[1] - 1, X_rw.shape[0] - 1)
+        if n_rw_comps < 1:
+            n_rw_comps = 1
+    else:
+        n_rw_comps = 1
+
+    svd_rw = TruncatedSVD(n_components=n_rw_comps, random_state=42)
+    X_rw_svd = svd_rw.fit_transform(X_rw)  # shape: (n_sonnets, n_rw_comps)
+
+    # Build a DF of rare-word features keyed by sonnet number
+    df_rw = pd.DataFrame({
+        "Num": sonnet_nums_rw,
+        "RareCluster": labels_agg
+    })
+    for i in range(n_rw_comps):
+        df_rw[f"RareLSA_{i+1}"] = X_rw_svd[:, i]
+
+    # --- 2. Merge with temporal / theme features from df_temporal ---
+    # df_temporal has columns: Num, Date, Score, RhymeDiversity, NounRatio, VerbRatio, AdjRatio, Theme_...
+    df_combined = pd.merge(df_temporal, df_rw, on="Num", how="inner")
+
+    # Identify theme columns
+    theme_cols = [c for c in df_combined.columns if c.startswith("Theme_")]
+
+    # Base metrics
+    base_features = ['Score', 'RhymeDiversity', 'NounRatio', 'VerbRatio', 'AdjRatio']
+
+    # Rare-word SVD features
+    rare_lsa_cols = [f"RareLSA_{i+1}" for i in range(n_rw_comps)]
+
+    # One-hot encode cluster labels
+    rare_cluster_dummies = pd.get_dummies(df_combined['RareCluster'], prefix='RareC')
+
+    # Build final feature matrix
+    feature_cols = base_features + theme_cols + rare_lsa_cols
+    X_base = df_combined[feature_cols].values
+    X_full = np.hstack([X_base, rare_cluster_dummies.values])
+
+    # --- 3. Standardize & PCA ---
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_full)
+
+    pca = PCA(n_components=2, random_state=42)
+    X_pca = pca.fit_transform(X_scaled)
+
+    df_combined['PC_comb1'] = X_pca[:, 0]
+    df_combined['PC_comb2'] = X_pca[:, 1]
+
+    # --- 4. Plot: PC1 vs PC2 with viridis colors by date & shapes by Ward cluster ---
+    df_combined['DateLabel'] = df_combined['Date'].astype(str)
+    unique_labels = sorted(df_combined['DateLabel'].unique(), key=lambda x: float(x))
+
+    palette_colors = sns.color_palette("viridis", n_colors=len(unique_labels))
+    palette_dict = {label: color for label, color in zip(unique_labels, palette_colors)}
+
+    markers = ['o', 's', '^', 'D', 'P', 'X', '*', 'v']
+
+    plt.figure(figsize=(12, 8))
+    ax = plt.gca()
+
+    # Convex hull per Ward cluster (faint, black outline)
+    for cid in sorted(df_combined['RareCluster'].unique()):
+        pts = df_combined[df_combined['RareCluster'] == cid][['PC_comb1', 'PC_comb2']].values
+        if len(pts) < 3:
+            continue
+        try:
+            hull = ConvexHull(pts)
+            hull_pts = pts[hull.vertices]
+            ax.fill(
+                hull_pts[:, 0],
+                hull_pts[:, 1],
+                facecolor='lightgray',
+                edgecolor='black',
+                alpha=0.15,
+                linewidth=0.15
+            )
+        except Exception:
+            # Degenerate cases: skip hull
+            pass
+
+    # Plot points
+    for _, row in df_combined.iterrows():
+        x, y = row['PC_comb1'], row['PC_comb2']
+        date_label = row['DateLabel']
+        color = palette_dict[date_label]
+        c_id = int(row['RareCluster'])
+        marker = markers[c_id % len(markers)]
+
+        ax.scatter(
+            x, y,
+            c=[color],
+            marker=marker,
+            edgecolors='black',
+            s=70,
+            alpha=0.9
+        )
+        ax.text(
+            x + 0.02,
+            y + 0.02,
+            str(int(row['Num'])),
+            fontsize=7
+        )
+
+    # Legends: date (color) and Ward cluster (shape)
+    date_handles = [
+        Line2D(
+            [0], [0],
+            marker='o', color='w',
+            label=lab,
+            markerfacecolor=palette_dict[lab],
+            markersize=8
+        )
+        for lab in unique_labels
+    ]
+
+    cluster_ids = sorted(df_combined['RareCluster'].unique())
+    cluster_handles = [
+        Line2D(
+            [0], [0],
+            marker=markers[c % len(markers)],
+            color='k',
+            linestyle='None',
+            label=f"RareC {c}"
+        )
+        for c in cluster_ids
+    ]
+
+    leg1 = ax.legend(
+        handles=date_handles,
+        title="Hypothesized Date",
+        loc='upper left'
+    )
+    ax.add_artist(leg1)
+
+    ax.legend(
+        handles=cluster_handles,
+        title="Ward Rare-word Cluster",
+        loc='lower left'
+    )
+
+    ax.set_title(
+        "Combined PCA: temporal metrics + LSA themes + rare-word Ward clusters"
+    )
+    ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.2%} var)")
+    ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.2%} var)")
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # --- 5. Textual characterization of each cluster ---
+    print("\n" + "="*70)
+    print("CLUSTER CHARACTERIZATION (Agglomerative Ward on rare words)")
+    print("="*70)
+
+    # Map from sonnet number -> row index in X_rw, so we can align clusters with X_rw
+    num_to_idx_rw = {num: idx for idx, num in enumerate(sonnet_nums_rw)}
+
+    for cid in cluster_ids:
+        df_c = df_combined[df_combined['RareCluster'] == cid]
+        n_c = len(df_c)
+
+        print(f"\n--- Cluster {cid} ---")
+        print(f"Number of sonnets: {n_c}")
+
+        if n_c == 0:
+            print("  (Empty cluster)")
+            continue
+
+        # 5a) Average temporal metrics
+        avg_metrics = {feat: df_c[feat].mean() for feat in base_features}
+        metrics_str = ", ".join(f"{k}={v:.3f}" for k, v in avg_metrics.items())
+        print(f"  Avg metrics: {metrics_str}")
+
+        # 5b) Dominant themes (by absolute mean loading)
+        if theme_cols:
+            theme_means = df_c[theme_cols].mean(axis=0)
+            theme_rank = theme_means.abs().sort_values(ascending=False)
+            top_themes = theme_rank.index[:3].tolist()
+            print("  Dominant themes:", ", ".join(top_themes))
+        else:
+            print("  Dominant themes: (none; no Theme_ columns found)")
+
+        # 5c) Top rare words defining this cluster
+        # Find indices in the rare-word matrix for sonnets in this cluster
+        idxs_rw = [
+            num_to_idx_rw[num]
+            for num in df_c['Num'].tolist()
+            if num in num_to_idx_rw
+        ]
+        if idxs_rw:
+            subX = X_rw[idxs_rw, :]
+            word_counts = np.asarray(subX.sum(axis=0)).ravel()
+            order = np.argsort(word_counts)[::-1]
+            top_n = 20
+            top_words = [
+                rare_words_rw[i]
+                for i in order[:top_n]
+                if word_counts[i] > 0
+            ]
+            print("  Top rare words:", ", ".join(top_words))
+        else:
+            print("  Top rare words: (no alignment with rare-word matrix)")
+
+    print("\n(End of cluster characterization.)")
+
+
+# --- EXECUTE FINAL COMBINED PCA ---
+# Requires:
+#   - df_temporal from your temporal/LSA cell
+#   - sonnets_map (already built in this notebook)
+if 'df_temporal' in locals() and 'sonnets_map' in locals():
+    combined_pca_temporal_and_rare_clusters(df_temporal, sonnets_map, n_clusters=6)
+else:
+    print("Note: df_temporal or sonnets_map not found. "
+          "Please run the temporal feature cell (extract_sonnet_features + analyze_and_visualize) first.")
+
+
 # %% [markdown] id="0kwpmkRfyvFj"
 # ## Analyze All Plays
 
@@ -3630,53 +3860,10 @@ if not os.path.exists(OUTPUT_DIR):
 
 print("Starting Batch Analysis...")
 
-# --- 1. Define Analysis Function (Multi-Window) ---
-def analyze_work_batch(title, lines):
-    # print(f"  Analyzing {title}...")
-    scores = []
-    window_sizes = [10, 11, 14, 15, 18]
-
-    clean_data = []
-    boundaries = []
-    current_clean_idx = 0
-    current_speaker = "UNKNOWN"
-
-    for line in lines:
-        s_line = line.strip()
-        if not s_line: continue
-
-        if s_line.upper().startswith("ACT "):
-            label = s_line.split('.')[0]
-            boundaries.append((current_clean_idx, label, 'act'))
-            # Do not continue; include line to maintain index alignment with classifier
-
-        if s_line.upper().startswith("SCENE "):
-            label = s_line.split('.')[0]
-            boundaries.append((current_clean_idx, label, 'scene'))
-            # Do not continue
-
-        if s_line.isupper() and s_line.endswith(".") and len(s_line) < 20 and "SCENE" not in s_line and "ACT" not in s_line:
-            current_speaker = s_line.strip(".")
-            # Do not continue
-
-        # MATCH CLASSIFIER FILTERING: Just non-empty lines
-        # (Previously was len > 10, which caused index mismatch with classifier results)
-        clean_data.append((s_line, current_speaker))
-        current_clean_idx += 1
-
-    clean_lines_text = [x[0] for x in clean_data]
-
-    for i in range(len(clean_lines_text)):
-        best_score_for_pos = 0.0
-        for w_size in window_sizes:
-            if i + w_size <= len(clean_lines_text):
-                window = clean_lines_text[i : i + w_size]
-                score = detector.score_window(window)
-                if score > best_score_for_pos:
-                    best_score_for_pos = score
-        scores.append(best_score_for_pos)
-
-    return scores, clean_data, boundaries
+# --- 1. Analysis function ---
+# Uses the shared analyze_work (cell 4): the same cleaned lines as the classifier windows,
+# and results are cached, so plays already scanned in cell 8b are not re-scored.
+analyze_work_batch = lambda title, lines: analyze_work(title, lines, verbose=False)
 
 # --- 2. Helper for Downloads ---
 def trigger_download(filepath):
@@ -3693,8 +3880,6 @@ results_text_buffer = []
 work_titles = sorted(works.keys())
 if "THE SONNETS" in work_titles:
     work_titles.remove("THE SONNETS")
-    work_titles.insert(0, "THE SONNETS")
-
     work_titles.insert(0, "THE SONNETS")
 
 # Batch Configuration
@@ -3743,20 +3928,7 @@ for batch_idx, batch_titles in enumerate(batches):
             pass
 
         # --- B. Identify Top 20 Hits (NMS) ---
-        scores_array = np.array(scores)
-        sorted_indices = scores_array.argsort()[::-1]
-        nms_indices = []
-        taken_mask = np.zeros(len(scores), dtype=bool)
-        nms_window = 18
-
-        for idx in sorted_indices:
-            if len(nms_indices) >= 20: break
-            if taken_mask[idx]: continue
-            nms_indices.append(idx)
-            start = max(0, idx - nms_window + 1)
-            end = min(len(scores), idx + nms_window)
-            taken_mask[start:end] = True
-
+        nms_indices = nms_top_k(scores, k=20)
         top_indices = nms_indices
 
         # --- C. Generate Individual Signal Plot ---
@@ -3820,7 +3992,7 @@ for batch_idx, batch_titles in enumerate(batches):
 
         power_smooth = gaussian_filter(power, sigma=(2, 2))
         variance = np.var(sig)
-        significance_threshold = variance * (stats.chi2.ppf(0.95, 2) / 2)
+        significance_threshold = variance * (stats.chi2.ppf(0.95, 2) / 2)   # TODO (method 5): AR(1) red-noise null
 
         # COI
         d_to_edge = np.minimum(t, (len(t) - 1) - t).astype(float)
@@ -4051,6 +4223,8 @@ print(f"Batch Analysis Complete. All outputs in {OUTPUT_DIR}/")
 # ## Metrics of Popularity
 
 # %% colab={"base_uri": "https://localhost:8080/"} id="S3Wmc0MTDVcg" outputId="bf867059-eb0d-43b3-bafb-17eab90f7f00"
+# NOTE: the numbers below were entered by hand and are estimates. Nothing downstream
+# uses them; cite a source for each (or delete this cell) before reporting them.
 # Cell 12
 
 # Data gathered from external sources (Wikipedia, Open Syllabus, Goodreads)
@@ -4122,28 +4296,23 @@ print("\nSaved metrics to shakespeare_external_metrics.csv")
 
 
 # %% colab={"base_uri": "https://localhost:8080/", "height": 549} id="ko1JoW8lnhGW" outputId="7d00a5ed-0e46-4170-b3d6-e25d356537c6"
-def grouped_bar_chart_5_dualaxis(values_list, labels, title, ylabel_left, ylabel_right):
+def grouped_bar_chart_5_dualaxis(values_list, labels, title, ylabel_left, ylabel_right, works=None):
     """
     values_list: list of 5 lists, one per work (each length = number of bins)
     labels: x-axis bin labels
     """
 
-    works = [
-        "Sonnets",
-        "Midsummer Night's Dream",
-        "Romeo and Juliet",
-        "Julius Caesar",
-        "Harry Potter"
-    ]
+    if works is None:
+        works = [f"Work {i + 1}" for i in range(len(values_list))]
 
     n_bins = len(labels)
     x = np.arange(n_bins)
 
-    n_works = 5
-    width = 0.15
+    n_works = len(values_list)
+    width = 0.8 / n_works
 
     # color map
-    cmap = plt.cm.get_cmap("viridis", n_works)
+    cmap = plt.get_cmap("viridis", n_works)
     colors = [cmap(i) for i in range(n_works)]
 
     # offsets for grouped bars
@@ -4204,43 +4373,30 @@ def grouped_bar_chart_5_dualaxis(values_list, labels, title, ylabel_left, ylabel
     plt.tight_layout()
     plt.show()
 
+# Build the inputs here (bug 8: frac_mnd, frac_rj, frac_jc, frac_hp were defined nowhere).
+# Harry Potter is dropped: its text isn't in this notebook.
+def _work_fractions(title):
+    toks = [w.lower() for t, _ in clean_play_lines(works[title])[0] for w in tokenize_words(t)]
+    return get_bin_fractions(toks, reference_counts=Counter(toks))
+
+bin_labels = ["1", "2", "3", "4", "5+"]
+COMPARE = {"Midsummer Night's Dream": "A MIDSUMMER NIGHT’S DREAM",
+           "Romeo and Juliet": "THE TRAGEDY OF ROMEO AND JULIET",
+           "Julius Caesar": "THE TRAGEDY OF JULIUS CAESAR"}
+COMPARE = {k: v for k, v in COMPARE.items() if v in works}
+frac_sonnets = get_bin_fractions(tokenize(" ".join(works["THE SONNETS"])))
+fracs = [frac_sonnets] + [_work_fractions(v) for v in COMPARE.values()]
+
 grouped_bar_chart_5_dualaxis(
-    [frac_sonnets, frac_mnd, frac_rj, frac_jc, frac_hp],
+    fracs,
     bin_labels,
     "Fraction of Word Usage (1–4 on left axis, 5+ on right axis)",
     "Fraction (bins 1–4)",
-    "Fraction (bin 5+)"
+    "Fraction (bin 5+)",
+    works=["Sonnets"] + list(COMPARE),
 )
 
 
-
-# %% colab={"base_uri": "https://localhost:8080/", "height": 71} id="umSs67kJkwt7" outputId="d305a888-7a85-4c6f-9e3a-30ab00a3306a"
-# Cell 8: Download Results (Colab Compatible)
-from google.colab import files
-
-def save_and_download(dataframe, filename, title):
-    # Write to the current working directory (Colab root)
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(f"{title}\n")
-        f.write("=" * len(title) + "\n\n")
-
-        current_play = None
-        for _, row in dataframe.iterrows():
-            if row['play'] != current_play:
-                f.write(f"\n--- {row['play']} ---\n")
-                current_play = row['play']
-
-            f.write(f"Line {row['line']} | Score: {row['sup']:.4f} (Sup) / {row['pu']:.4f} (PU)\n")
-            f.write(f"{row['text']}\n")
-            f.write("-" * 20 + "\n")
-
-    print(f"Downloading: {filename}")
-    files.download(filename)
-
-# Trigger downloads for the dataframes already in memory
-save_and_download(top_sup_df, "sonnet_candidates_supervised.txt", "Top 5% Candidates - Supervised Classifier")
-save_and_download(top_pu_df, "sonnet_candidates_pu.txt", "Top 5% Candidates - PU Classifier")
-save_and_download(intersection_df, "sonnet_candidates_intersection.txt", "Top 5% Candidates - INTERSECTION (Both Methods)")
 
 # %% [markdown] id="pD437fdsy9gB"
 # # Part 4 - Distinctness
@@ -4258,92 +4414,16 @@ WORK_TO_ANALYZE = "THE TRAGEDY OF ROMEO AND JULIET"
 COMPARISON_WORKS = ["A MIDSUMMER NIGHT’S DREAM", "TROILUS AND CRESSIDA", "THE TRAGEDY OF ROMEO AND JULIET"]
 # ---------------------
 
-# Initialize Neural G2P
-neural_g2p = G2p()
-print("Neural G2P Model Loaded.")
-
-def get_neural_stress_pattern(line):
-    phonemes = neural_g2p(line)
-    pattern = []
-    for p in phonemes:
-        if p[-1].isdigit():
-            stress = int(p[-1])
-            pattern.append(1 if stress > 0 else 0)
-    return pattern
-
-class AdvancedSonnetDetector(SonnetDetector):
-    def score_window(self, lines):
-        if len(lines) != 14: return 0.0
-
-        # 1. Neural Meter Score
-        meter_scores = []
-        syllable_scores = []
-
-        for line in lines:
-            pat = get_neural_stress_pattern(line)
-            if len(pat) == 11 and pat[-1] == 0:
-                meter_scores.append(is_iambic(pat[:-1]))
-                syllable_scores.append(1.0)
-            else:
-                meter_scores.append(is_iambic(pat))
-                dist = abs(len(pat) - 10)
-                syllable_scores.append(max(0, 1.0 - (dist * 0.1)))
-
-        avg_meter = np.mean(meter_scores)
-        avg_syllable = np.mean(syllable_scores)
-
-        # 2. Rhyme (Reuse existing logic)
-        last_words = [re.findall(r"\w+", l)[-1] if re.findall(r"\w+", l) else "" for l in lines]
-        quatrain_scores = []
-        for i in range(0, 12, 4):
-            w = last_words[i:i+4]
-            if self.check_rhyme(w[0], w[2]) and self.check_rhyme(w[1], w[3]): quatrain_scores.append(1.0)
-            elif self.check_rhyme(w[0], w[3]) and self.check_rhyme(w[1], w[2]): quatrain_scores.append(0.8)
-            elif self.check_rhyme(w[0], w[1]) and self.check_rhyme(w[2], w[3]): quatrain_scores.append(0.6)
-            else: quatrain_scores.append(0.2 if (self.check_rhyme(w[0], w[2]) or self.check_rhyme(w[1], w[3])) else 0.0)
-        rhyme_val = np.mean(quatrain_scores)
-        couplet_val = 1.0 if self.check_rhyme(last_words[12], last_words[13]) else 0.0
-
-        return (avg_meter * 0.25) + (avg_syllable * 0.15) + (rhyme_val * 0.35) + (couplet_val * 0.25)
-
-adv_detector = AdvancedSonnetDetector()
+# The neural detector is now the SAME scorer and weights as the rule detector (bug 3);
+# the only difference is mode="g2p": words missing from CMU are pronounced by the neural
+# G2P model instead of a vowel-counting guess. (g2p_en itself looks words up in CMU first,
+# so running it on whole lines mostly re-derived CMU stresses, very slowly.)
+adv_detector = SonnetDetector(mode="g2p")
 print("Advanced Sonnet Detector Ready.")
-
-# --- 1. Deep Dive Analysis (Signal Plot & Text) ---
 
 def analyze_work_advanced(title, lines, detector):
     print(f"Analyzing {title} with Neural Detector...")
-    scores = []
-    window_size = 14
-    clean_data = []
-    boundaries = []
-    current_clean_idx = 0
-    current_speaker = "UNKNOWN"
-
-    for line in lines:
-        s_line = line.strip()
-        if not s_line: continue
-        if s_line.upper().startswith("ACT "):
-            label = s_line.split('.')[0]
-            boundaries.append((current_clean_idx, label, 'act'))
-            continue
-        if s_line.upper().startswith("SCENE "):
-            label = s_line.split('.')[0]
-            boundaries.append((current_clean_idx, label, 'scene'))
-            continue
-        if s_line.isupper() and s_line.endswith(".") and len(s_line) < 20 and "SCENE" not in s_line and "ACT" not in s_line:
-            current_speaker = s_line.strip(".")
-            continue
-        if len(s_line) > 10:
-            clean_data.append((s_line, current_speaker))
-            current_clean_idx += 1
-
-    clean_lines_text = [x[0] for x in clean_data]
-    for i in range(len(clean_lines_text) - window_size):
-        window = clean_lines_text[i : i + window_size]
-        score = detector.score_window(window)
-        scores.append(score)
-    return scores, clean_data, boundaries
+    return analyze_work(title, lines, mode=detector.mode, verbose=False)
 
 # Run Analysis on Target Work
 lines = works[WORK_TO_ANALYZE]
@@ -4381,15 +4461,7 @@ for idx, label, b_type in boundaries:
         ax.text(idx, 1.01, label, rotation=90, fontsize=6, verticalalignment='bottom')
 
 # Top Markers (NMS)
-scores_array = np.array(scores)
-sorted_indices = scores_array.argsort()[::-1]
-nms_indices = []
-taken_mask = np.zeros(len(scores), dtype=bool)
-for idx in sorted_indices:
-    if len(nms_indices) >= 20: break
-    if taken_mask[idx]: continue
-    nms_indices.append(idx)
-    taken_mask[max(0, idx-14):min(len(scores), idx+14)] = True
+nms_indices = nms_top_k(scores, k=20)
 
 for idx in nms_indices:
     ax.plot(idx, scores[idx], 'k.', markersize=5)
@@ -4407,8 +4479,7 @@ for i, idx in enumerate(nms_indices[:10]):
     print(f"\nRank {i+1} | Score: {scores[idx]:.4f} | Start Line: {idx}")
     print("-" * 20)
     last_speaker = None
-    for j in range(idx, idx+14):
-        line_text, speaker = clean_data[j]
+    for line_text, speaker in clean_data[idx: idx + 14]:
         prefix = ""
         if speaker != last_speaker:
             prefix = f"[{speaker}] "
@@ -4420,18 +4491,7 @@ print(f"\nComparing Score Distributions for: {COMPARISON_WORKS}")
 plt.figure(figsize=(12, 6))
 
 # Baseline: The Sonnets
-sonnet_scores = []
-current_sonnet = []
-for line in works["THE SONNETS"]:
-    s = line.strip()
-    if not s: continue
-    if s.isdigit() or re.match(r'^[XVI]+(\.)?$', s):
-        if len(current_sonnet) >= 14:
-            sonnet_scores.append(adv_detector.score_window(current_sonnet[:14]))
-        current_sonnet = []
-    else:
-        current_sonnet.append(s)
-if len(current_sonnet) >= 14: sonnet_scores.append(adv_detector.score_window(current_sonnet[:14]))
+sonnet_scores = [adv_detector.score_window(v[:14]) for v in parse_sonnets_map(works, min_lines=14).values()]
 
 sns.kdeplot(sonnet_scores, label="THE SONNETS (Baseline)", fill=True, alpha=0.3, linewidth=2)
 
@@ -4479,16 +4539,25 @@ tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 model = BertModel.from_pretrained('bert-base-uncased')
 print("BERT Loaded.")
 
-def get_line_embedding(line):
-    inputs = tokenizer(line, return_tensors="pt", padding=True, truncation=True, max_length=128)
-    with torch.no_grad():
-        outputs = model(**inputs)
-    return outputs.last_hidden_state[:, 0, :].numpy()
+model.eval()
+_EMB_CACHE = {}
+
+def embed_lines(lines, batch_size=64):
+    """[CLS] embeddings for many lines in batched forward passes, cached per line.
+    TODO (method 6): mean-pool or use a sentence-embedding model; raw [CLS] is weak."""
+    todo = [l for l in dict.fromkeys(lines) if l not in _EMB_CACHE]
+    for i in range(0, len(todo), batch_size):
+        chunk = todo[i:i + batch_size]
+        inputs = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=128)
+        with torch.no_grad():
+            out = model(**inputs).last_hidden_state[:, 0, :].numpy()
+        _EMB_CACHE.update(zip(chunk, out))
+    return np.vstack([_EMB_CACHE[l] for l in lines]) if lines else np.zeros((0, 768))
 
 def score_semantic_coherence(lines):
-    embeddings = [get_line_embedding(l) for l in lines if l.strip()]
-    if len(embeddings) < 2: return 0.0
-    embeddings = np.vstack(embeddings)
+    lines = [l for l in lines if l.strip()]
+    if len(lines) < 2: return 0.0
+    embeddings = embed_lines(lines)
     sim_matrix = cosine_similarity(embeddings)
     upper_tri = sim_matrix[np.triu_indices(len(sim_matrix), k=1)]
     return np.mean(upper_tri)
@@ -4497,19 +4566,7 @@ def score_semantic_coherence(lines):
 coherence_data = []
 
 # A. The Sonnets (Baseline)
-sonnets_map_bert = {}
-curr = []
-c_num = 0
-for l in works["THE SONNETS"]:
-    s = l.strip()
-    if not s: continue
-    if s.isdigit() or re.match(r'^[XVI]+(\.)?$', s):
-        if curr: sonnets_map_bert[c_num] = curr
-        curr = []
-        try: c_num = int(s.strip('.'))
-        except: c_num += 1
-    else: curr.append(s)
-if curr: sonnets_map_bert[c_num] = curr
+sonnets_map_bert = parse_sonnets_map(works)
 
 print("Scoring 'THE SONNETS'...")
 for i in range(1, 21): # Sample first 20 for speed/viz
@@ -4521,10 +4578,10 @@ for i in range(1, 21): # Sample first 20 for speed/viz
 for title in COHERENCE_WORKS:
     print(f"Scoring '{title}'...")
     scores, clean, _ = analyze_work(title, works[title])
-    top_indices = np.argsort(scores)[-TOP_N_CANDIDATES:][::-1]
+    top_indices = nms_top_k(scores, k=TOP_N_CANDIDATES)     # bug 11: no near-duplicate windows
 
     for idx in top_indices:
-        lines = [clean[j][0] for j in range(idx, idx+14)]
+        lines = window_lines(clean, idx)                        # clipped at the end of the play
         coh = score_semantic_coherence(lines)
         coherence_data.append({"Work": title, "Type": "Candidate", "Coherence": coh})
 
@@ -4564,9 +4621,9 @@ for num, lines in sonnets_map_bert.items():
 for title in STYLO_WORKS:
     scores, clean, _ = analyze_work(title, works[title])
     # Take top 20 candidates
-    top_indices = np.argsort(scores)[-20:][::-1]
+    top_indices = nms_top_k(scores, k=20)        # bug 11
     for idx in top_indices:
-        lines = [clean[j][0] for j in range(idx, idx+14)]
+        lines = window_lines(clean, idx)
         corpus.append(" ".join(lines))
         labels.append(title)
 
@@ -4645,17 +4702,27 @@ def get_line_embedding(line: str) -> np.ndarray:
 
 
 # --- DISTINCTNESS HELPERS ---
+_DIST_EMB_CACHE = {}
+
+def embed_lines_batched(lines, batch_size=64):
+    """Batched, cached version of get_line_embedding."""
+    todo = [l for l in dict.fromkeys(lines) if l not in _DIST_EMB_CACHE]
+    for i in range(0, len(todo), batch_size):
+        chunk = todo[i:i + batch_size]
+        inputs = bert_tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=128)
+        with torch.no_grad():
+            out = bert_model(**inputs).last_hidden_state[:, 0, :].numpy()
+        _DIST_EMB_CACHE.update(zip(chunk, out))
+    return np.vstack([_DIST_EMB_CACHE[l] for l in lines])
+
+# TODO (method 6): raw [CLS] from un-fine-tuned BERT gives cosine ~1 for everything;
+# mean-pool or use a sentence-embedding model, and validate on the 22 known sonnets.
 def get_text_centroid(lines):
-    """
-    Given a list of lines, compute the centroid of their BERT embeddings.
-    Returns a (1, EMBED_DIM) numpy array.
-    """
+    """Centroid of the lines' BERT embeddings, shape (1, EMBED_DIM)."""
+    lines = [l for l in lines if l.strip()]
     if not lines:
         return np.zeros((1, EMBED_DIM))
-    embeddings = [get_line_embedding(l) for l in lines if l.strip()]
-    if not embeddings:
-        return np.zeros((1, EMBED_DIM))
-    return np.mean(np.vstack(embeddings), axis=0, keepdims=True)
+    return np.mean(embed_lines_batched(lines), axis=0, keepdims=True)
 
 
 def analyze_contextual_distinctness(work_title, top_n=5):
@@ -4671,18 +4738,7 @@ def analyze_contextual_distinctness(work_title, top_n=5):
     scores, clean_data, _ = analyze_work(work_title, works[work_title])
     scores_array = np.array(scores)
 
-    # Non-Maximum Suppression (to avoid overlapping 14-line windows)
-    top_indices = []
-    taken_mask = np.zeros(len(scores), dtype=bool)
-    sorted_indices = scores_array.argsort()[::-1]  # high to low
-
-    for idx in sorted_indices:
-        if len(top_indices) >= top_n:
-            break
-        if taken_mask[idx]:
-            continue
-        top_indices.append(idx)
-        taken_mask[max(0, idx - 14):min(len(scores), idx + 14)] = True
+    top_indices = nms_top_k(scores, k=top_n)      # shared NMS
 
     results = []
     for rank, idx in enumerate(top_indices):
@@ -4766,6 +4822,7 @@ print(df_dist[["Work", "Rank", "Score", "Semantic_Dist", "Style_Dist", "Snippet"
 # %% colab={"base_uri": "https://localhost:8080/"} id="TdVCIWkPXWbq" outputId="85f28177-92ad-4cd2-b6fb-0005731f4887"
 TOP_N_DISTINCT = 20
 
+all_results = []          # bug 10: start fresh so cell 41's rows aren't plotted twice
 for title in DISTINCTNESS_WORKS:
     res = analyze_contextual_distinctness(title, top_n=TOP_N_DISTINCT)
     for r in res:
