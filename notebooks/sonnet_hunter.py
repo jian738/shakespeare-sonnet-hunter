@@ -943,6 +943,13 @@ def clean_play_lines(lines):
     """
     clean_data, boundaries = [], []
     speaker = "UNKNOWN"
+    # Third run: Gutenberg sometimes drops the period after a speaker tag ("PROLOGUE",
+    # "FORD", "SNOUT"), so the tag was discarded and the speech credited to the previous
+    # speaker (MND's Prologue came out as THESEUS). A bare tag counts if the same play
+    # also uses that name with a period, or it is PROLOGUE/EPILOGUE/CHORUS (line 0 is the title).
+    dotted = {l.strip().translate(_APOS)[:-1] for l in lines
+              if len(l.strip()) < 40 and _SPEAKER_RE.match(l.strip().translate(_APOS))}
+    dotted |= {"PROLOGUE", "EPILOGUE", "CHORUS"}
     in_direction = False                      # inside a [ ... ] that spans several lines
     for li, raw in enumerate(lines):
         s = raw.strip()
@@ -967,6 +974,9 @@ def clean_play_lines(lines):
             continue
         if len(s) < 40 and _SPEAKER_RE.match(s.translate(_APOS)):
             speaker = s.rstrip(".")
+            continue
+        if li > 0 and s.translate(_APOS) in dotted and li + 1 < len(lines) and lines[li + 1].strip():
+            speaker = s
             continue
         if _DIRECTION_RE.match(s):
             continue
