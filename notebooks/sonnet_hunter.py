@@ -763,9 +763,10 @@ print(per_sonnet.to_string(index=False))
 # A known sonnet can be missed because it scores low, or because a stronger peak within
 # NMS_RADIUS lines suppressed it (second run: LLL 4.3.57 was missed by the rule detector
 # but ranked 21st by the supervised classifier).
-def explain_misses(score_by_play, ranks, name, top=50):
+def explain_misses(score_by_play, ranks, name, top=50, known=None):
+    known = known_df if known is None else known
     print(f"\n{name}: known sonnets outside the top {top}")
-    for (_, row), r in zip(known_df.iterrows(), ranks):
+    for (_, row), r in zip(known.iterrows(), ranks):
         if r <= top:
             continue
         sc = np.asarray(score_by_play[row["play"]]); i = int(row["line"])
@@ -798,6 +799,29 @@ for split in ("tune", "test"):
     print(f"rule + PU (fused), {split}: recall@50 {row['recall@50']:.2f}, median rank {row['median_rank']:.0f}")
 (rl, rh), (ml, mh) = bootstrap_ci(rank_table["rule + PU (fused)"])
 print(f"  all {len(known_df)}: recall@50 = {np.mean(rank_table['rule + PU (fused)'] <= 50):.2f} [{rl:.2f}, {rh:.2f}]")
+
+# --- Sonnets discovered after the detector was built (never used for tuning) --
+# DISCOVERED_SONNETS lives in src/known_sonnets.py (e.g. sonnets found by hand in Midsummer).
+# They are NOT in known_df, so no weight or setting is ever chosen on them; this only
+# reports where the rule and fused rankings put them, and why any are missed.
+def report_discovered(discovered=DISCOVERED_SONNETS):
+    if not discovered:
+        print("\nDISCOVERED_SONNETS is empty: add entries in src/known_sonnets.py to report their ranks.")
+        return
+    disc = locate_known_sonnets(works, discovered, {})
+    lost = disc[disc["play"].isna()]["label"].tolist()
+    disc = disc.dropna(subset=["play"]).reset_index(drop=True)
+    disc["line"] = disc["line"].astype(int)
+    if lost:
+        print("Discovered sonnets not located in the cleaned plays:", lost)
+    tbl = pd.DataFrame({"label": disc["label"], "play": disc["play"], "line": disc["line"],
+                        "rule": known_ranks(ranked_hits(rule_scores()), disc),
+                        "rule + PU (fused)": known_ranks(ranked_hits(fused), disc)})
+    print("\nDiscovered sonnets (reported only, never tuned on): rank in each ranking")
+    print(tbl.to_string(index=False))
+    explain_misses(rule_scores(), tbl["rule"].values, "rule (WEIGHTS), discovered", known=disc)
+
+report_discovered()
 
 # --- Does full credit for 10-line forms help? -------------------------------
 # 6 of the 22 known sonnets have 10 lines (ABAB CDCD EE), but a two-quatrain body only
