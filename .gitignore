@@ -17,3 +17,5 @@ sonnet_candidates_*.csv
 # OS / editor
 .DS_Store
 .vscode/settings.json
+runs/
+data/
