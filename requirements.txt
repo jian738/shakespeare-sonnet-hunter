@@ -20,3 +20,4 @@ tqdm
 # Repo tooling (local only)
 jupytext
 nbstripout
+pytest

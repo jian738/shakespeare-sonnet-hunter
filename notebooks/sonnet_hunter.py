@@ -78,6 +78,24 @@ except ImportError:
 # Initialize CMU Dict
 d = cmudict.dict()
 
+# Version 8: the shared toolkit (cell 4) lives in src/sonnet_toolkit.py so it can be
+# unit-tested. Run from a checkout -> use its src/; in Colab -> clone the repo at TOOLKIT_REF.
+import sys, subprocess
+TOOLKIT_REF = "v8"            # a tag or branch of the repo; pin it so a run is reproducible
+REPO_URL = "https://github.com/jian738/shakespeare-sonnet-hunter.git"
+_here = [p for p in (os.path.abspath("src"), os.path.abspath("../src"))
+         if os.path.exists(os.path.join(p, "sonnet_toolkit.py"))]
+if _here:
+    TOOLKIT_DIR = _here[0]
+else:
+    if not os.path.exists("shakespeare-sonnet-hunter"):
+        subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", TOOLKIT_REF,
+                        REPO_URL, "shakespeare-sonnet-hunter"], check=True)
+    TOOLKIT_DIR = os.path.abspath("shakespeare-sonnet-hunter/src")
+if TOOLKIT_DIR not in sys.path:
+    sys.path.insert(0, TOOLKIT_DIR)
+print("Toolkit from:", TOOLKIT_DIR)
+
 import sklearn, transformers
 print(f"numpy {np.__version__} | pandas {pd.__version__} | sklearn {sklearn.__version__} | "
       f"torch {torch.__version__} | transformers {transformers.__version__} | nltk {nltk.__version__}")
@@ -91,25 +109,12 @@ print(f"numpy {np.__version__} | pandas {pd.__version__} | sklearn {sklearn.__ve
 
 # %% colab={"base_uri": "https://localhost:8080/"} id="Obp7sm5p1mgE" outputId="175174b4-095c-40f8-c47c-9835e2cdc9e6"
 # Cell 2: Data Acquisition
+from sonnet_toolkit import strip_gutenberg
 def download_shakespeare():
     url = "https://www.gutenberg.org/files/100/100-0.txt"
     response = requests.get(url)
     response.encoding = 'utf-8-sig'
-    text = response.text
-
-    # Remove Gutenberg Headers/Footers
-    start_marker = "*** START OF THE PROJECT GUTENBERG EBOOK"
-    end_marker = "*** END OF THE PROJECT GUTENBERG EBOOK"
-
-    start_idx = text.find(start_marker)
-    end_idx = text.find(end_marker)
-
-    if start_idx != -1:
-        text = text[start_idx + len(start_marker):]
-    if end_idx != -1:
-        text = text[:end_idx]
-
-    return text
+    return strip_gutenberg(response.text)     # header/footer removal: toolkit (version 8)
 
 full_text = download_shakespeare()
 print(f"Downloaded {len(full_text)} characters.")
@@ -120,62 +125,14 @@ print(f"Downloaded {len(full_text)} characters.")
 # %% colab={"base_uri": "https://localhost:8080/"} id="Tb4sX9J_1muf" outputId="2c7fd1d6-f53e-42f8-ab2e-27a00de1a7e1"
 # Cell 3: Parsing Plays, Sonnets, and PLAY SONNETS
 
-# 1. Works list, now including PLAY SONNETS
-works_list = [
-    "THE SONNETS", "ALL’S WELL THAT ENDS WELL", "THE TRAGEDY OF ANTONY AND CLEOPATRA",
-    "AS YOU LIKE IT", "THE COMEDY OF ERRORS", "THE TRAGEDY OF CORIOLANUS",
-    "CYMBELINE", "THE TRAGEDY OF HAMLET, PRINCE OF DENMARK",
-    "THE FIRST PART OF KING HENRY THE FOURTH", "THE SECOND PART OF KING HENRY THE FOURTH",
-    "THE LIFE OF KING HENRY THE FIFTH", "THE FIRST PART OF HENRY THE SIXTH",
-    "THE SECOND PART OF KING HENRY THE SIXTH", "THE THIRD PART OF KING HENRY THE SIXTH",
-    "KING HENRY THE EIGHTH", "THE LIFE AND DEATH OF KING JOHN",
-    "THE TRAGEDY OF JULIUS CAESAR", "THE TRAGEDY OF KING LEAR",
-    "LOVE’S LABOUR’S LOST", "THE TRAGEDY OF MACBETH",
-    "MEASURE FOR MEASURE", "THE MERCHANT OF VENICE",
-    "THE MERRY WIVES OF WINDSOR", "A MIDSUMMER NIGHT’S DREAM",
-    "MUCH ADO ABOUT NOTHING", "THE TRAGEDY OF OTHELLO, THE MOOR OF VENICE",
-    "PERICLES, PRINCE OF TYRE", "KING RICHARD THE SECOND",
-    "KING RICHARD THE THIRD", "THE TRAGEDY OF ROMEO AND JULIET",
-    "THE TAMING OF THE SHREW", "THE TEMPEST",
-    "THE LIFE OF TIMON OF ATHENS", "THE TRAGEDY OF TITUS ANDRONICUS",
-    "TROILUS AND CRESSIDA", "TWELFTH NIGHT; OR, WHAT YOU WILL",
-    "THE TWO GENTLEMEN OF VERONA", "THE TWO NOBLE KINSMEN",
-    "THE WINTER’S TALE", "A LOVER’S COMPLAINT",
-    "THE PASSIONATE PILGRIM", "THE PHOENIX AND THE TURTLE",
-    "THE RAPE OF LUCRECE", "VENUS AND ADONIS",
-    "PLAY SONNETS"  # synthetic work we add manually after parsing
-]
-
-def parse_works(text):
-    # Skip the contents table itself
-    contents_end = text.find("VENUS AND ADONIS") + len("VENUS AND ADONIS")
-    current_pos = max(0, contents_end)
-
-    sorted_indices = []
-    for work in works_list:
-        idx = text.find(work, current_pos)
-        if idx != -1:
-            sorted_indices.append((idx, work))
-
-    sorted_indices.sort()
-
-    parsed_data = {}
-
-    for i in range(len(sorted_indices)):
-        start_idx, title = sorted_indices[i]
-        end_idx = sorted_indices[i+1][0] if i + 1 < len(sorted_indices) else len(text)
-
-        work_text = text[start_idx:end_idx]
-        lines = [l.strip() for l in work_text.split('\n') if l.strip()]
-        parsed_data[title] = lines
-
-    return parsed_data
+# 1. Works list and parse_works() live in the toolkit (version 8), so tests can
+#    rebuild `works` exactly as this cell does.
+from sonnet_toolkit import works_list, parse_works
 
 # --- Helpers to build PLAY SONNETS from the full text ---
 
-def _normalize_for_match(s):
-    # Lowercase, strip everything that is not a-z or 0-9
-    return re.sub(r'[^a-z0-9]', '', s.lower())
+# Lowercase, strip everything that is not a-z or 0-9 (one copy, in the toolkit)
+from sonnet_toolkit import normalize_for_match as _normalize_for_match
 
 def find_sonnet_in_full_text(full_text, first_line, num_lines):
     """
@@ -198,328 +155,9 @@ def find_sonnet_in_full_text(full_text, first_line, num_lines):
     print(f"WARNING: could not find passage starting with: {first_line!r}")
     return []
 
-# --- Manual overrides for passages that Gutenberg layout breaks ---
-
-manual_play_sonnets = {
-    # Two Gentlemen of Verona, full 10-line sonnet
-    "The Two Gentlemen of Verona, 3.1.140–9.": [
-        "My thoughts do harbour with my Silvia nightly,",
-        "And slaves they are to me that send them flying.",
-        "O, could their master come and go as lightly,",
-        "Himself would lodge where, senseless, they are lying.",
-        "My herald thoughts in thy pure bosom rest them,",
-        "While I, their king, that thither them importune,",
-        "Do curse the grace that with such grace hath blest them,",
-        "Because myself do want my servants’ fortune.",
-        "I curse myself, for they are sent by me,",
-        "That they should harbour where their lord should be.",
-    ],
-
-    # Edward III passage, cleaned into verse lines
-    "Edward III, scene 2.322–3.": [
-        "And let me have her likened to the sun –",
-        "Say she hath thrice more splendour than the sun,",
-        "That her perfections emulates the sun,",
-        "That she breeds sweets as plenteous as the sun,",
-        "That she doth thaw cold winter like the sun,",
-        "That she doth cheer fresh summer, like the sun,",
-        "That she doth dazzle gazers like the sun,",
-        "And in this application to the sun",
-        "Bid her be free and general as the sun,",
-        "Who smiles upon the basest weed that grows",
-        "As lovingly as on the fragrant rose.",
-    ],
-
-    # Comedy of Errors sonnet including the missing last line
-    "The Comedy of Errors, 3.2.41–54.": [
-        "But if that I am I, then well I know",
-        "Your weeping sister is no wife of mine,",
-        "Nor to her bed no homage do I owe.",
-        "Far more, far more, to you do I decline.",
-        "O, train me not, sweet mermaid, with thy note",
-        "To drown me in thy sister’s flood of tears.",
-        "Sing, siren, for thyself, and I will dote;",
-        "Spread o’er the silver waves thy golden hairs,",
-        "And as a bed I’ll take thee, and there lie,",
-        "And, in that glorious supposition think",
-        "He gains by death that hath such means to die.",
-        "Let love, being light, be drowned if she sink!",
-        "LUCIANA.",
-        "What, are you mad, that you do reason so?",
-        "Not mad, but mated – how, I do not know.",
-    ],
-
-    # Love’s Labour’s Lost 1.1.80–9, with the extra four lines
-    "Love’s Labour’s Lost, 1.1.80–9.": [
-        "Study me how to please the eye indeed",
-        "By fixing it upon a fairer eye,",
-        "Who dazzling so, that eye shall be his heed,",
-        "And give him light that it was blinded by.",
-        "Study is like the heaven’s glorious sun,",
-        "That will not be deep-searched with saucy looks;",
-        "Small have continual plodders ever won,",
-        "Save base authority from others’ books.",
-        "These earthly godfathers of heaven’s lights,",
-        "That give a name to every fixed star,",
-        "Have no more profit of their shining nights",
-        "Than those that walk and wot not what they are.",
-        "Too much to know is to know naught but fame,",
-        "And every godfather can give a name.",
-    ],
-
-    # Love’s Labour’s Lost 1.1.159–74, WITHOUT "BEROWNE."
-    "Love’s Labour’s Lost, 1.1.159–74.": [
-        "Ay, that there is. Our court, you know, is haunted",
-        "With a refined traveller of Spain,",
-        "A man in all the world’s new fashion planted,",
-        "That hath a mint of phrases in his brain;",
-        "One who the music of his own vain tongue",
-        "Doth ravish like enchanting harmony,",
-        "A man of complements, whom right and wrong",
-        "Have chose as umpire of their mutiny.",
-        "This child of fancy, that Armado hight,",
-        "For interim to our studies shall relate",
-        "In high-born words the worth of many a knight",
-        "From tawny Spain lost in the world’s debate.",
-        "How you delight, my lords, I know not, I,",
-        "But I protest I love to hear him lie,",
-        "And I will use him for my minstrelsy.",
-    ],
-
-    # Love’s Labour’s Lost 4.3.24–39, full poem
-    "Love’s Labour’s Lost, 4.3.24–39.": [
-        "So sweet a kiss the golden sun gives not",
-        "To those fresh morning drops upon the rose,",
-        "As thy eye-beams, when their fresh rays have smote",
-        "The night of dew that on my cheeks down flows.",
-        "Nor shines the silver moon one half so bright",
-        "Through the transparent bosom of the deep",
-        "As doth thy face, through tears of mine give light.",
-        "Thou shin’st in every tear that I do weep.",
-        "No drop but as a coach doth carry thee;",
-        "So ridest thou triumphing in my woe.",
-        "Do but behold the tears that swell in me,",
-        "And they thy glory through my grief will show.",
-        "But do not love thyself; then thou wilt keep",
-        "My tears for glasses, and still make me weep.",
-        "O queen of queens, how far dost thou excel",
-        "No thought can think, nor tongue of mortal tell.",
-    ],
-
-    # Love’s Labour’s Lost 5.2.401–15, WITHOUT "ROSALINE."
-    "Love’s Labour’s Lost, 5.2.401–15.": [
-        "O, never will I trust to speeches penned,",
-        "Nor to the motion of a school-boy’s tongue,",
-        "Nor never come in visor to my friend,",
-        "Nor woo in rhyme like a blind harper’s song.",
-        "Taffeta phrases, silken terms precise,",
-        "Three-piled hyperboles, spruce affectation,",
-        "Figures pedantical: these summer flies",
-        "Have blown me full of maggot ostentation.",
-        "I do forswear them, and I here protest,",
-        "By this white glove—how white the hand, God knows!—",
-        "Henceforth my wooing mind shall be expressed",
-        "In russet yeas and honest kersey noes.",
-        "And, to begin: wench, so God help me, law,",
-        "My love to thee is sound, sans crack or flaw.",
-    ],
-
-    # Romeo and Juliet, 1.5.92–109: the shared sonnet (verse-only form)
-    "Romeo and Juliet, 1.5.92–109.": [
-        "If I profane with my unworthiest hand",
-        "This holy shrine, the gentle sin is this:",
-        "My lips, two blushing pilgrims, ready stand",
-        "To smooth that rough touch with a tender kiss.",
-        "Good pilgrim, you do wrong your hand too much,",
-        "Which mannerly devotion shows in this;",
-        "For saints have hands that pilgrims’ hands do touch,",
-        "And palm to palm is holy palmers’ kiss.",
-        "Have not saints lips, and holy palmers too?",
-        "Ay, pilgrim, lips that they must use in prayer.",
-        "O, then, dear saint, let lips do what hands do:",
-        "They pray, grant thou, lest faith turn to despair.",
-        "Saints do not move, though grant for prayers’ sake.",
-        "Then move not while my prayer’s effect I take.",
-    ],
-
-    # Much Ado About Nothing, 3.1.107–16
-    "Much Ado About Nothing, 3.1.107–16.": [
-        "What fire is in mine ears? Can this be true?",
-        "Stand I condemn’d for pride and scorn so much?",
-        "Contempt, farewell! and maiden pride, adieu!",
-        "No glory lives behind the back of such.",
-        "And, Benedick, love on; I will requite thee,",
-        "Taming my wild heart to thy loving hand:",
-        "If thou dost love, my kindness shall incite thee",
-        "To bind our loves up in a holy band;",
-        "For others say thou dost deserve, and I",
-        "Believe it better than reportingly.",
-    ],
-
-    # All’s Well That Ends Well, 3.4.4–17
-    "All’s Well That Ends Well, 3.4.4–17.": [
-        "I am Saint Jaques’ pilgrim, thither gone.",
-        "Ambitious love hath so in me offended",
-        "That barefoot plod I the cold ground upon,",
-        "With sainted vow my faults to have amended.",
-        "Write, write, that from the bloody course of war",
-        "My dearest master, your dear son, may hie.",
-        "Bless him at home in peace, whilst I from far",
-        "His name with zealous fervour sanctify.",
-        "His taken labours bid him me forgive;",
-        "I, his despiteful Juno, sent him forth",
-        "From courtly friends, with camping foes to live,",
-        "Where death and danger dog the heels of worth.",
-        "He is too good and fair for death and me;",
-        "Whom I myself embrace to set him free.",
-    ],
-
-    # Pericles, scene 10.1–14: expanded full passage
-    "Pericles, scene 10.1–14.": [
-        "Now sleep y-slackèd hath the rout;",
-        "No din but snores about the house,",
-        "Made louder by the o’erfed breast",
-        "Of this most pompous marriage feast.",
-        "The cat, with eyne of burning coal,",
-        "Now couches fore the mouse’s hole;",
-        "And crickets sing at the oven’s mouth,",
-        "Are the blither for their drouth.",
-        "Hymen hath brought the bride to bed,",
-        "Where, by the loss of maidenhead,",
-        "A babe is moulded. Be attent,",
-        "And time that is so briefly spent",
-        "With your fine fancies quaintly eche:",
-        "What’s dumb in show I’ll plain with speech.",
-    ],
-
-    # Pericles, scene 21.225–35: explicit 10-line sonnet, NO stage directions
-    "Pericles, scene 21.225–35.": [
-        "My temple stands in Ephesus. Hie thee thither,",
-        "And do upon mine altar sacrifice.",
-        "There when my maiden priests are met together,",
-        "At large discourse thy fortunes in this wise:",
-        "With a full voice before the people all,",
-        "Reveal how thou at sea didst lose thy wife.",
-        "To mourn thy crosses, with thy daughter’s, call",
-        "And give them repetition to the life.",
-        "Perform my bidding, or thou liv’st in woe;",
-        "Do ’t, and rest happy, by my silver bow.",
-    ],
-}
-
-# The 22 “play sonnets”, with target counts (used only when not overridden)
-play_sonnet_specs = [
-    {
-        "label": "The Two Gentlemen of Verona, 3.1.140–9.",
-        "first_line": "My thoughts do harbour with my Silvia nightly",
-        "num_lines": 10,
-    },
-    {
-        "label": "Edward III, scene 2.322–3.",
-        "first_line": "And let me have her likened to the sun",
-        "num_lines": 11,
-    },
-    {
-        "label": "The Comedy of Errors, 3.2.41–54.",
-        "first_line": "But if that I am I, then well I know",
-        "num_lines": 15,
-    },
-    {
-        "label": "Love’s Labour’s Lost, 1.1.80–9.",
-        "first_line": "Study me how to please the eye indeed",
-        "num_lines": 14,
-    },
-    {
-        "label": "Love’s Labour’s Lost, 1.1.159–74.",
-        "first_line": "Ay, that there is. Our court, you know, is haunted",
-        "num_lines": 16,
-    },
-    {
-        "label": "Love’s Labour’s Lost, 4.2.106–19.",
-        "first_line": "If love make me forsworn, how shall I swear to love?",
-        "num_lines": 14,
-    },
-    {
-        "label": "Love’s Labour’s Lost, 4.3.24–39.",
-        "first_line": "So sweet a kiss the golden sun gives not",
-        "num_lines": 16,
-    },
-    {
-        "label": "Love’s Labour’s Lost, 4.3.57–70.",
-        "first_line": "Did not the heavenly rhetoric of thine eye,",
-        "num_lines": 14,
-    },
-    {
-        "label": "Love’s Labour’s Lost, 5.2.401–15.",
-        "first_line": "O, never will I trust to speeches penned,",
-        "num_lines": 15,
-    },
-    {
-        "label": "Romeo and Juliet, Prologue.",
-        "first_line": "Two households, both alike in dignity",
-        "num_lines": 14,
-    },
-    {
-        "label": "Romeo and Juliet, 1.5.92–109.",
-        "first_line": "If I profane with my unworthiest hand",
-        "num_lines": 14,
-    },
-    {
-        "label": "Romeo and Juliet, 2.0. Introduction to Act Two.",
-        "first_line": "Now old desire doth in his deathbed lie,",
-        "num_lines": 14,
-    },
-    {
-        "label": "A Midsummer Night’s Dream, 5.1.108–17.",
-        "first_line": "If we offend, it is with our good will.",
-        "num_lines": 10,
-    },
-    {
-        "label": "Much Ado About Nothing, 3.1.107–16.",
-        "first_line": "What fire is in mine ears? Can this be true?",
-        "num_lines": 10,
-    },
-    {
-        "label": "Henry V, Epilogue.",
-        "first_line": "Thus far, with rough and all-unable pen,",
-        "num_lines": 14,
-    },
-    {
-        "label": "As You Like It, 3.2.1–10.",
-        "first_line": "Hang there, my verse, in witness of my love.",
-        "num_lines": 10,
-    },
-    {
-        "label": "Troilus and Cressida, 1.2.278–91.",
-        "first_line": "Words, vows, gifts, tears, and love’s full sacrifice",
-        "num_lines": 14,
-    },
-    {
-        "label": "All’s Well That Ends Well, 1.1.212–225.",
-        "first_line": "Our remedies oft in ourselves do lie,",
-        "num_lines": 14,
-    },
-    {
-        "label": "All’s Well That Ends Well, 3.4.4–17.",
-        "first_line": "I am Saint Jaques’ pilgrim, thither gone.",
-        "num_lines": 14,
-    },
-    {
-        "label": "Pericles, scene 10.1–14.",
-        "first_line": "Now sleep y-slackèd hath the rout,",
-        "num_lines": 14,
-    },
-    {
-        "label": "Pericles, scene 21.225–35.",
-        "first_line": "My temple stands in Ephesus. Hie thee thither,",
-        "num_lines": 10,
-    },
-    {
-        "label": "Cymbeline, 5.5.187–204.",
-        "first_line": "No more, you petty spirits of region low,",
-        "num_lines": 18,
-    },
-]
+# --- The 22 known play sonnets (and manual overrides) live in src/known_sonnets.py
+#     (version 8): one copy for this notebook and tests/. Never tune on DISCOVERED_SONNETS.
+from known_sonnets import manual_play_sonnets, play_sonnet_specs, DISCOVERED_SONNETS
 
 def build_play_sonnets(full_text, specs, manual_passages=None):
     """
@@ -590,674 +228,19 @@ for line in works["PLAY SONNETS"]:
 # tokens and the same weights. (Before this cell existed, count_syllables,
 # get_stress_pattern, analyze_work, the line filter and the weights each had
 # 2-4 slightly different copies, which is where several bugs came from.)
+#
+# Version 8: the code now lives in src/sonnet_toolkit.py (fetched in cell 1) and is
+# tested by tests/test_cleaner.py. Change settings THERE. To try a setting for one
+# run, assign it on the module, e.g. tk.SHORT_FORM_CREDIT = 1.0 (assigning the
+# imported name in the notebook would not reach the toolkit's functions).
 # -----------------------------------------------------------------------------
-
-# ---------- 0. Configuration -------------------------------------------------
-# One set of weights used by EVERY rule-based detector (bug 3).
-# These are the weights your docstring documents.
-# First full run (Oct 13): tune_weights() on the 7 tune-half sonnets chose
-# meter 0.4 / syllable 0 / rhyme 0.3 / couplet 0.3, but the test half did not move
-# (recall@50 0.62 -> 0.62, median rank 28 -> 28). With n this small that is noise,
-# so the documented weights are kept. Re-tune once more known sonnets are located.
-WEIGHTS = {"meter": 0.25, "syllable": 0.15, "rhyme": 0.35, "couplet": 0.25}
-COMPONENTS = ("meter", "syllable", "rhyme", "couplet")
-WINDOW_SIZES = (10, 11, 14, 15, 18)
-# Rhyme credit for a body that is not exactly three quatrains. Two quatrains + couplet
-# (10 lines, ABAB CDCD EE) is a real form: 6 of the 22 known play sonnets have 10 lines.
-# The second run ranked several of them low (Much Ado 3.1 at 951). The evaluation cell
-# compares 0.75 with 1.0 on the known sonnets; change this only if the TEST half improves.
-SHORT_FORM_CREDIT = 0.75
-NMS_RADIUS = max(WINDOW_SIZES)          # suppress hits closer than one window
-
-# ---------- 1. Tokenising (bug 2) --------------------------------------------
-# Gutenberg uses curly apostrophes (’) and _underscores_ for italics.
-# r"\w+" split "sister’s" into "sister" + "s" (an extra stressed beat) and
-# kept "_" as a word, so an italic line ending "tongue._" ended in "_".
-_APOS = str.maketrans({"’": "'", "‘": "'", "ʼ": "'"})
-_WORD_RE = re.compile(r"'?[A-Za-z]+(?:'[A-Za-z]+)*'?")
-
-def normalize_line(line):
-    return line.translate(_APOS).replace("_", "")
-
-def tokenize_words(line):
-    """Words of a verse line, apostrophes kept inside words ("o'er", "'tis")."""
-    return _WORD_RE.findall(normalize_line(line))
-
-def end_word(line):
-    words = tokenize_words(line)
-    return words[-1].lower().strip("'") if words else ""
-
-# ---------- 2. Pronunciation lookup ------------------------------------------
-# A few Early Modern forms CMU lacks.
-_EME_PRONS = {
-    "o'er": [["OW1", "R"]], "e'er": [["EH1", "R"]], "ne'er": [["N", "EH1", "R"]],
-    "th'": [["DH"]], "i'": [["IH0"]], "o'": [["AH0"]], "ta'en": [["T", "EY1", "N"]],
-    "eyne": [["AY1", "N"]], "hie": [["HH", "AY1"]], "wot": [["W", "AA1", "T"]],
-}
-_CONS = {"s": "Z", "st": "S T", "d": "D", "t": "T"}
-
-@lru_cache(maxsize=None)
-def _cmu_prons(word):
-    """All CMU pronunciations of word (lower-case), handling elisions; None if unknown."""
-    w = word.lower()
-    if w in d: return d[w]
-    if w in _EME_PRONS: return _EME_PRONS[w]
-    bare = w.strip("'")
-    if bare in d: return d[bare]
-    # possessive / elided endings: sister's, liv'st, lov'd  -> base + consonant, no extra syllable
-    for suf in ("'st", "'d", "'s", "'t"):
-        if w.endswith(suf):
-            base = w[: -len(suf)]
-            for cand in (base, base + "e"):
-                if cand in d:
-                    tail = _CONS[suf[1:]].split()
-                    return [p + tail for p in d[cand]]
-    joined = w.replace("'", "")
-    if joined in d: return d[joined]
-    return None
-
-_G2P_MODEL = None
-@lru_cache(maxsize=None)
-def _g2p_prons(word):
-    """Neural G2P for out-of-vocabulary words only (g2p_en itself uses CMU for known words)."""
-    global _G2P_MODEL
-    if _G2P_MODEL is None:
-        _G2P_MODEL = G2p()
-    phones = [p for p in _G2P_MODEL(word) if p.strip()]
-    return [phones] if phones else None
-
-def word_prons(word, mode="cmu"):
-    prons = _cmu_prons(word)
-    if prons is None and mode == "g2p":
-        prons = _g2p_prons(word.lower().strip("'"))
-    return prons
-
-def _fallback_syllables(word):
-    w = word.lower().replace("'", "")
-    n = len(re.findall(r"[aeiouy]+", w))
-    if w.endswith("e") and not w.endswith(("le", "ee", "ye")) and n > 1:
-        n -= 1                                   # silent final e
-    return max(n, 1) if w else 0
-
-def count_syllables(word, mode="cmu"):
-    prons = word_prons(word, mode)
-    if prons:
-        return sum(p[-1].isdigit() for p in prons[0])
-    return _fallback_syllables(word)
-
-# ---------- 3. Stress and meter (method 4) -----------------------------------
-# CMU marks nearly every monosyllable as stressed ("my", "do", "with"), which
-# made ordinary iambic lines look irregular. Monosyllabic function words are
-# now unstressed, other monosyllables stressed, and both are "flexible":
-# a flexible syllable in the "wrong" slot costs 0.5 instead of 1.
-FUNCTION_WORDS = set("""
-a an the and but or nor for so yet if as than that though while when where whence
-whose who whom which what i me my mine we us our you your ye thou thee thy thine
-he him his she her it its they them their this these those there here
-to of in on at by from with without into upon unto o'er through
-am is are was were be been being do does did doth dost hath hast have has had
-shall shalt should will wilt would can canst could may mayst might must
-not no all such some each own 'tis 'twas t' th' i' o' 'gainst
-""".split())
-
-@lru_cache(maxsize=None)
-def word_stress(word, mode="cmu"):
-    """Tuple of (stress, flexible) per syllable."""
-    w = word.lower()
-    prons = word_prons(w, mode)
-    if prons:
-        stresses = [int(p[-1]) for p in prons[0] if p[-1].isdigit()]
-    else:
-        stresses = [None] * _fallback_syllables(w)          # unknown word
-    if len(stresses) == 1:
-        return ((0, True),) if w.strip("'") in FUNCTION_WORDS or w in FUNCTION_WORDS else ((1, True),)
-    out = []
-    for s in stresses:
-        if s is None: out.append((1, True))                  # unknown: no hard claim
-        elif s == 1: out.append((1, False))
-        elif s == 2: out.append((1, True))                   # secondary stress is flexible
-        else: out.append((0, False))
-    return tuple(out)
-
-def get_stress_pattern(line, mode="cmu"):
-    """0/1 pattern (kept for old plotting code); see line_stress for flexibility."""
-    return [s for s, _ in line_stress(line, mode)]
-
-@lru_cache(maxsize=None)
-def line_stress(line, mode="cmu"):
-    out = []
-    for w in tokenize_words(line):
-        out.extend(word_stress(w, mode))
-    return tuple(out)
-
-_IAMB = [0, 1] * 5
-_TEMPLATES = [
-    _IAMB,                        # regular pentameter
-    [1, 0] + _IAMB[2:],           # trochaic first foot
-    _IAMB + [0],                  # feminine ending
-    [1, 0] + _IAMB[2:] + [0],     # both
-]
-
-def _align_cost(pattern, template):
-    """Edit distance: hard mismatch 1, flexible mismatch 0.5, missing/extra syllable 1."""
-    n, m = len(pattern), len(template)
-    prev = [float(j) for j in range(m + 1)]
-    for i in range(1, n + 1):
-        s, flex = pattern[i - 1]
-        cur = [float(i)] + [0.0] * m
-        for j in range(1, m + 1):
-            sub = 0.0 if s == template[j - 1] else (0.5 if flex else 1.0)
-            cur[j] = min(prev[j - 1] + sub, prev[j] + 1.0, cur[j - 1] + 1.0)
-        prev = cur
-    return prev[m]
-
-def meter_score(pattern):
-    """Best alignment of a line's stresses against iambic pentameter variants (0-1)."""
-    if len(pattern) < 7 or len(pattern) > 14:
-        return 0.0
-    cost = min(_align_cost(pattern, t) for t in _TEMPLATES)
-    return max(0.0, 1.0 - cost / 10.0)
-
-def is_iambic(pattern):
-    """Backward-compatible wrapper: accepts a plain 0/1 list."""
-    return meter_score(tuple((s, False) for s in pattern))
-
-def syllable_score(pattern):
-    n = len(pattern)
-    if n == 10 or (n == 11 and pattern[-1][0] == 0):     # 11 only with an unstressed (feminine) ending
-        return 1.0
-    return max(0.0, 1.0 - 0.1 * abs(n - 10))
-
-@lru_cache(maxsize=None)
-def line_features(line, mode="cmu"):
-    """Everything the rule score needs from ONE line, computed once and cached
-    (a line sits in ~68 overlapping windows of sizes 10-18)."""
-    pat = line_stress(line, mode)
-    return meter_score(pat), syllable_score(pat), end_word(line)
-
-# ---------- 4. Rhyme (bug 1, method 4) ---------------------------------------
-_HISTORICAL_GROUPS = [
-    ["love", "move", "prove", "remove", "approve", "reprove"],
-    ["gone", "foregone", "begone", "alone", "moan", "bemoan", "one", "none", "done", "shown", "own", "upon", "on"],
-    ["forth", "worth"],
-    ["wind", "mind", "kind", "find", "behind", "blind"],
-    ["come", "doom", "tomb", "home", "roam"],
-    ["heaven", "even", "given", "driven", "riven"],
-    ["great", "defeat", "seat", "eat", "conceit"],
-    ["tongue", "young", "song", "wrong", "long", "sung", "strong", "among"],
-    ["war", "are", "far", "star", "jar"],
-    ["blood", "good", "flood", "stood", "food", "brood", "mood"],
-    ["eye", "melancholy", "remedy", "majesty", "die", "lie", "history"],
-]
-HISTORICAL_RHYMES = defaultdict(set)
-for group in _HISTORICAL_GROUPS:
-    for a in group:
-        HISTORICAL_RHYMES[a].update(g for g in group if g != a)
-
-# Same stressed vowel, different final consonants (moan/o'er). Slightly below 0.5 so that
-# scheme LABELS (check_rhyme, min_level 0.5) skip it: the second run labelled Sonnet 30
-# "ABBA" because foregone/before and o'er/moan matched on vowels alone.
-SLANT_LEVEL = 0.45
-
-def _strip(phones):
-    return tuple(re.sub(r"\d", "", ph) for ph in phones)
-
-def _rhyme_parts(prons):
-    """Last STRESSED vowel to the end, stress digits removed (so AY1 matches AY2)."""
-    parts = set()
-    for p in prons:
-        idx = next((i for i in range(len(p) - 1, -1, -1) if p[i][-1] in "12"), None)
-        if idx is None:
-            idx = next((i for i in range(len(p) - 1, -1, -1) if p[i][-1].isdigit()), len(p) - 1)
-        parts.add(_strip(p[idx:]))
-    return parts
-
-def _final_syllable_parts(prons):
-    """Last vowel (stressed or not) to the end: dignity/mutiny, argument/punishment."""
-    parts = set()
-    for p in prons:
-        idx = next((i for i in range(len(p) - 1, -1, -1) if p[i][-1].isdigit()), None)
-        if idx is not None:
-            parts.add(_strip(p[idx:]))
-    return parts
-
-_REDUCED = {"AH0", "IH0", "ER0", "UH0"}
-
-def _final_vowel_and_coda(prons):
-    out = set()
-    for p in prons:
-        idx = next((i for i in range(len(p) - 1, -1, -1) if p[i][-1].isdigit()), None)
-        if idx is not None and idx < len(p) - 1:          # needs a final consonant
-            out.add((p[idx], tuple(p[idx + 1:])))
-    return out
-
-def _reduced_final_match(p1, p2):
-    """Final syllables share their consonants and at least one vowel is a reduced schwa:
-    CMU writes 'ornament' with AH0 where Shakespeare's rhyme with 'content' is audible."""
-    for v1, c1 in _final_vowel_and_coda(p1):
-        for v2, c2 in _final_vowel_and_coda(p2):
-            if c1 == c2 and (v1 in _REDUCED or v2 in _REDUCED):
-                return True
-    return False
-
-def _n_syll(prons):
-    return sum(ph[-1].isdigit() for ph in prons[0])
-
-@lru_cache(maxsize=None)
-def rhyme_level(w1, w2, mode="cmu"):
-    """
-    1.0  perfect rhyme (same stressed vowel + everything after it) or a listed historical rhyme
-    0.5  weaker rhyme: identical word; same final syllable in a polysyllable (dignity/mutiny);
-         Early Modern '-y' = 'eye' (perjury/eye); same stressed vowel, different coda (slant)
-    0.0  otherwise.
-    The old rule also accepted 'same last two letters' or 'same last vowel LETTER', which made
-    ~30% of random line-end pairs 'rhyme' (love/time).
-    """
-    w1, w2 = w1.lower().strip("'"), w2.lower().strip("'")
-    if not w1 or not w2:
-        return 0.0
-    if w1 == w2:
-        return 0.5
-    if w2 in HISTORICAL_RHYMES.get(w1, ()):
-        return 1.0
-    p1, p2 = word_prons(w1, mode), word_prons(w2, mode)
-    if p1 and p2:
-        r1, r2 = _rhyme_parts(p1), _rhyme_parts(p2)
-        if r1 & r2:
-            return 1.0
-        if max(_n_syll(p1), _n_syll(p2)) > 1 and _final_syllable_parts(p1) & _final_syllable_parts(p2):
-            return 0.5
-        if max(_n_syll(p1), _n_syll(p2)) > 1 and _reduced_final_match(p1, p2):
-            return 0.5        # ornament/content: same final consonants, one vowel reduced by CMU
-        ay1 = any(r[0] == "AY" for r in r1); ay2 = any(r[0] == "AY" for r in r2)
-        if (ay1 and w2.endswith("y") and _n_syll(p2) > 1) or (ay2 and w1.endswith("y") and _n_syll(p1) > 1):
-            return 0.5
-        v1 = {r[0] for r in r1 if r}; v2 = {r[0] for r in r2 if r}
-        return SLANT_LEVEL if v1 & v2 else 0.0
-    # unknown word: only a 3-letter spelling match, and only as a weak rhyme
-    if len(w1) >= 3 and len(w2) >= 3 and w1[-3:] == w2[-3:] and re.search(r"[aeiouy]", w1[-3:]):
-        return 0.5
-    return 0.0
-
-def check_rhyme(w1, w2, mode="cmu", min_level=0.5):
-    """Yes/no rhyme, used ONLY for scheme labels (ABAB / ABBA ...), never for scoring.
-    Accepts weak rhymes: with min_level=1.0 the first run labelled Sonnet 1 'Irregular'
-    because die/memory is an Early Modern '-y' rhyme (level 0.5)."""
-    return rhyme_level(w1, w2, mode) >= min_level
-
-# ---------- 5. The one window scorer -----------------------------------------
-_SCHEMES = [((0, 2), (1, 3), 1.0),   # ABAB
-            ((0, 3), (1, 2), 0.8),   # ABBA
-            ((0, 1), (2, 3), 0.6)]   # AABB  (old AAAA branch was unreachable: AAAA also matches AABB)
-
-def quatrain_score(w, mode="cmu"):
-    best = 0.2 * max(rhyme_level(w[0], w[2], mode), rhyme_level(w[1], w[3], mode))
-    for a, b, val in _SCHEMES:
-        best = max(best, val * min(rhyme_level(w[a[0]], w[a[1]], mode),
-                                   rhyme_level(w[b[0]], w[b[1]], mode)))
-    return best
-
-def _shape_credit(nq, rem):
-    if nq == 3 and rem == 0:
-        return 1.0
-    if nq == 2 and rem == 0:
-        return SHORT_FORM_CREDIT
-    return 0.75
-
-def window_parts(lines, mode="cmu"):
-    """Component scores (meter, syllable, rhyme, couplet) for one window, each 0-1."""
-    if len(lines) < 8:
-        return np.zeros(4)
-    feats = [line_features(l, mode) for l in lines]
-    meter = np.mean([f[0] for f in feats])
-    syll = np.mean([f[1] for f in feats])
-    ends = [f[2] for f in feats]
-    body = ends[:-2]
-    nq, rem = divmod(len(body), 4)
-    q = [quatrain_score(body[i:i + 4], mode) for i in range(0, nq * 4, 4)]
-    rhyme = (np.mean(q) if q else 0.0) * _shape_credit(nq, rem)
-    couplet = rhyme_level(ends[-2], ends[-1], mode)
-    return np.array([meter, syll, rhyme, couplet])
-
-def weights_vector(weights=None):
-    weights = weights or WEIGHTS
-    return np.array([weights[c] for c in COMPONENTS])
-
-def score_window(lines, weights=None, mode="cmu"):
-    return float(window_parts(lines, mode) @ weights_vector(weights))
-
-# ---------- 6. One line cleaner for every cell (bug 6, method 2) ------------
-_SPEAKER_RE = re.compile(r"^[A-Z][A-Z’'\-,&\. ]*[A-Z]\.$")
-_DIRECTION_RE = re.compile(r"^(Enter|Exit|Exeunt|Re-enter|Flourish|Alarum|Sennet|Music|Thunder)\b")
-_INLINE_DIRECTION_RE = re.compile(r"\[[^\]]*\]")
-_NUMBER_RE = re.compile(r"^[0-9IVXLC]+\.?$")
-
-def clean_play_lines(lines):
-    """
-    Turn a work's raw lines into spoken text only.
-    Returns clean_data = [(text, speaker)], boundaries = [(clean_idx, label, 'act'|'scene')].
-    Removes: blank lines, ACT/SCENE headings, speaker tags (ROMEO.), stage directions
-    ([Exit.], Enter ..., inline [_Aside_]) and italic underscores.
-    Every scan, classifier window and plot uses THIS function, so line index i means
-    the same line everywhere.
-    """
-    clean_data, boundaries = [], []
-    speaker = "UNKNOWN"
-    # Third run: Gutenberg sometimes drops the period after a speaker tag ("PROLOGUE",
-    # "FORD", "SNOUT"), so the tag was discarded and the speech credited to the previous
-    # speaker (MND's Prologue came out as THESEUS). A bare tag counts if the same play
-    # also uses that name with a period, or it is PROLOGUE/EPILOGUE/CHORUS (line 0 is the title).
-    dotted = {l.strip().translate(_APOS)[:-1] for l in lines
-              if len(l.strip()) < 40 and _SPEAKER_RE.match(l.strip().translate(_APOS))}
-    dotted |= {"PROLOGUE", "EPILOGUE", "CHORUS"}
-    in_direction = False                      # inside a [ ... ] that spans several lines
-    for li, raw in enumerate(lines):
-        s = raw.strip()
-        if not s:
-            continue
-        if in_direction:                      # skip until the closing bracket
-            if "]" in s:
-                in_direction = False
-                s = s.split("]", 1)[1].strip()
-                if not s:
-                    continue
-            else:
-                continue
-        up = s.upper()
-        if up.startswith("ACT ") or up.startswith("SCENE "):
-            kind = "act" if up.startswith("ACT ") else "scene"
-            boundaries.append((len(clean_data), s.split(".")[0], kind))
-            continue
-        if up in ("PROLOGUE.", "EPILOGUE."):  # a speaker in MND 5.1, a section elsewhere: both
-            boundaries.append((len(clean_data), s.rstrip("."), "scene"))
-            speaker = s.rstrip(".")
-            continue
-        if len(s) < 40 and _SPEAKER_RE.match(s.translate(_APOS)):
-            speaker = s.rstrip(".")
-            continue
-        if li > 0 and s.translate(_APOS) in dotted and li + 1 < len(lines) and lines[li + 1].strip():
-            speaker = s
-            continue
-        if _DIRECTION_RE.match(s):
-            continue
-        # First run: lines like "[_To Juliet._] If I profane with my unworthiest hand"
-        # were dropped whole because they start with "[". Strip the bracketed part
-        # and keep whatever verse follows it.
-        s = _INLINE_DIRECTION_RE.sub("", s)
-        if "[" in s:                          # an opening bracket with no close on this line
-            # Second run: an unclosed "[" could swallow verse until the next "]" anywhere
-            # below. Only treat it as a multi-line direction if "]" appears within 4 lines;
-            # otherwise it's a stray bracket: drop the character, keep the text.
-            if any("]" in nxt for nxt in lines[li + 1: li + 5]):
-                s, in_direction = s.split("[", 1)[0], True
-            else:
-                s = s.replace("[", "")
-        s = s.replace("_", "").strip()
-        if not s or s.isupper() or _NUMBER_RE.match(s):   # titles, sonnet numbers, empty
-            continue
-        clean_data.append((s, speaker))
-    return clean_data, boundaries
-
-# ---------- 7. Scanning with caching -----------------------------------------
-SCAN_CACHE = {}
-
-def scan_work(title, lines, mode="cmu", window_sizes=WINDOW_SIZES, use_cache=True):
-    """
-    Score every start position with every window size, fast.
-    Per-line features are computed once; per-quatrain and per-couplet rhyme scores are
-    computed once per start line; a window's score is then assembled from those pieces.
-    (Gives exactly the same numbers as window_parts on each window.)
-    Returns dict with:
-      parts  : array (n_lines, n_sizes, 4) of component scores (NaN where the window doesn't fit)
-      clean_data, boundaries, window_sizes
-    Re-weighting later is a dot product, so tuning WEIGHTS never needs a re-scan.
-    """
-    key = (title, mode, tuple(window_sizes), SHORT_FORM_CREDIT)
-    if use_cache and key in SCAN_CACHE:
-        return SCAN_CACHE[key]
-    clean_data, boundaries = clean_play_lines(lines)
-    text = [t for t, _ in clean_data]
-    n = len(text)
-    feats = [line_features(t, mode) for t in text]
-    meter = np.array([f[0] for f in feats]); syll = np.array([f[1] for f in feats])
-    ends = [f[2] for f in feats]
-    cm = np.concatenate([[0.0], np.cumsum(meter)]); cs = np.concatenate([[0.0], np.cumsum(syll)])
-    quat = np.array([quatrain_score(ends[j:j + 4], mode) if j + 4 <= n else 0.0 for j in range(n)])
-    coup = np.array([rhyme_level(ends[j], ends[j + 1], mode) if j + 1 < n else 0.0 for j in range(n)])
-    parts = np.full((n, len(window_sizes), 4), np.nan)
-    for k, w in enumerate(window_sizes):
-        if w < 8 or w > n:
-            continue
-        nq, rem = divmod(w - 2, 4)
-        mult = _shape_credit(nq, rem)
-        starts = np.arange(0, n - w + 1)
-        parts[starts, k, 0] = (cm[starts + w] - cm[starts]) / w
-        parts[starts, k, 1] = (cs[starts + w] - cs[starts]) / w
-        if nq:
-            parts[starts, k, 2] = np.mean([quat[starts + 4 * q] for q in range(nq)], axis=0) * mult
-        else:
-            parts[starts, k, 2] = 0.0
-        parts[starts, k, 3] = coup[starts + w - 2]
-    res = {"parts": parts, "clean_data": clean_data, "boundaries": boundaries,
-           "window_sizes": tuple(window_sizes)}
-    SCAN_CACHE[key] = res
-    return res
-
-def scores_from_scan(scan, weights=None):
-    """Best score over window sizes at each start line, and which size won."""
-    s = np.nan_to_num(scan["parts"] @ weights_vector(weights), nan=0.0)
-    if s.size == 0:
-        return np.zeros(0), np.zeros(0, dtype=int)
-    best = s.argmax(axis=1)
-    return s.max(axis=1), np.array(scan["window_sizes"])[best]
-
-def analyze_work(title, lines, weights=None, mode="cmu", verbose=True):
-    """Drop-in replacement for the old analyze_work copies: (scores, clean_data, boundaries)."""
-    if verbose:
-        print(f"Analyzing {title}...")
-    scan = scan_work(title, lines, mode)
-    scores, _ = scores_from_scan(scan, weights)
-    return list(scores), scan["clean_data"], scan["boundaries"]
-
-# ---------- 8. Non-maximum suppression (one copy) ----------------------------
-def nms_top_k(scores, k=10, radius=NMS_RADIUS):
-    """Indices of the k best positions, none within `radius` lines of a better one."""
-    scores = np.asarray(scores)
-    taken = np.zeros(len(scores), dtype=bool)
-    picked = []
-    for idx in np.argsort(scores)[::-1]:
-        if k is not None and len(picked) >= k:
-            break
-        if taken[idx]:
-            continue
-        picked.append(int(idx))
-        taken[max(0, idx - radius + 1): idx + radius] = True
-    return picked
-
-def window_lines(clean_data, idx, size=14):
-    """Lines of a window, clipped at the end of the work (bug 11)."""
-    return [t for t, _ in clean_data[idx: min(idx + size, len(clean_data))]]
-
-
-# ---------- 9. Shared parsing helpers (one copy each) ------------------------
-NON_PLAY_TITLES = {"THE SONNETS", "A LOVER’S COMPLAINT", "THE PASSIONATE PILGRIM",
-                   "THE PHOENIX AND THE TURTLE", "THE RAPE OF LUCRECE", "VENUS AND ADONIS",
-                   "PLAY SONNETS"}      # PLAY SONNETS is a synthetic copy of text already in the plays
-_SONNET_HEADER_RE = re.compile(r"^(\d+|[XVILC]+)\.?$")
-
-def parse_sonnets_map(works, min_lines=10):
-    """{sonnet number: [lines]} for THE SONNETS (replaces 4 separate parsing loops)."""
-    out, cur, num = {}, [], 0
-    for line in works.get("THE SONNETS", []):
-        s = line.strip()
-        if not s or s == "THE SONNETS":
-            continue
-        if _SONNET_HEADER_RE.match(s):
-            if len(cur) >= min_lines:
-                out[num] = cur
-            cur = []
-            try: num = int(s.strip("."))
-            except ValueError: num += 1
-        else:
-            cur.append(s)
-    if len(cur) >= min_lines:
-        out[num] = cur
-    return out
-
-def parse_play_sonnets(works):
-    """[(label, [lines])] for the synthetic PLAY SONNETS work, speaker tags removed."""
-    out, label, cur = [], None, []
-    for line in works.get("PLAY SONNETS", []):
-        m = re.match(r"^=== PLAY SONNET \d+: (.*) \(\d+ lines\) ===$", line)
-        if m:
-            if label is not None: out.append((label, cur))
-            label, cur = m.group(1), []
-        elif line.strip() and not _SPEAKER_RE.match(line.strip().translate(_APOS)):
-            cur.append(line.strip())
-    if label is not None: out.append((label, cur))
-    return out
-
-def get_sonnet_date(num):
-    """Approximate composition date of a sonnet (one copy; used by cells 9 and 10b)."""
-    if 1 <= num <= 60: return 1596
-    elif 61 <= num <= 77: return 1594.5
-    elif 78 <= num <= 86: return 1599
-    elif 87 <= num <= 103: return 1594.5
-    elif 104 <= num <= 126: return 1602
-    elif 127 <= num <= 144: return 1593
-    elif num == 145: return 1582
-    elif 146 <= num <= 154: return 1593
-    return None
-
-# ---------- 10. Statistics for dependent data (method 5) --------------------
-def ar1_wavelet_threshold(sig, scales, wavelet="cmor1.5-1.0", smooth_sigma=(2, 2),
-                          n_surr=30, q=0.95, seed=0):
-    """
-    Red-noise significance for a wavelet power spectrum (Torrence & Compo 1998, by simulation).
-
-    The detection signal comes from overlapping windows, so neighbouring values are strongly
-    correlated: it behaves like red noise, which naturally has lots of power at long periods.
-    A white-noise threshold (variance * chi2) therefore calls far too much "significant".
-
-    Here we fit AR(1) (lag-1 autocorrelation alpha), simulate n_surr AR(1) series with the
-    same alpha and variance, push each through the SAME wavelet + smoothing, and take the
-    q-quantile of their power at each scale. Simulating (instead of using the analytic
-    formula) makes the threshold automatically match pywt's normalisation and the smoothing.
-
-    Returns (threshold per scale, alpha). Significant where power_smooth / threshold[:, None] > 1.
-    """
-    sig = np.asarray(sig, float) - np.mean(sig)
-    n = len(sig)
-    var = np.var(sig)
-    alpha = float(np.corrcoef(sig[:-1], sig[1:])[0, 1]) if n > 2 and var > 0 else 0.0
-    alpha = min(max(alpha, 0.0), 0.99)
-    rng = np.random.default_rng(seed)
-    pooled = []
-    for _ in range(n_surr):
-        e = rng.normal(0, np.sqrt(var * (1 - alpha ** 2)), n)
-        x = np.empty(n); x[0] = rng.normal(0, np.sqrt(var))
-        for t in range(1, n):
-            x[t] = alpha * x[t - 1] + e[t]
-        c, _ = pywt.cwt(x - x.mean(), scales, wavelet, method="fft")
-        pooled.append(gaussian_filter(np.abs(c) ** 2, sigma=smooth_sigma))
-    pooled = np.stack(pooled)                        # surrogates x scales x time
-    # Use only points inside the cone of influence: edge-affected power is artificially low
-    # and would drag the threshold down.
-    t = np.arange(n); edge = np.minimum(t, n - 1 - t)
-    thr = np.empty(len(scales))
-    for k, sc in enumerate(scales):
-        inside = edge >= np.sqrt(2) * sc
-        vals = pooled[:, k, inside] if inside.sum() >= 10 else pooled[:, k, :]
-        thr[k] = np.quantile(vals, q)
-    return thr, alpha
-
-def window_permutation_test(values_per_line, weights_per_line, starts, size=14,
-                            n_perm=5000, seed=0, min_gap=None):
-    """
-    Is the rate in the chosen windows unusual for this play?  The unit is the WINDOW, not
-    the line: lines inside one window share speaker, scene and topic, so treating 280 lines
-    as 280 independent samples (a t-test) overstates the evidence.
-
-    values_per_line: e.g. rare-word count per line;  weights_per_line: tokens per line.
-    observed = mean over the chosen windows of (sum values / sum weights).
-    null     = the same statistic for len(starts) randomly placed, non-overlapping windows.
-    Returns dict(observed, null_mean, null_sd, p_two_sided, p_greater).
-    """
-    v = np.concatenate([[0.0], np.cumsum(values_per_line)])
-    w = np.concatenate([[0.0], np.cumsum(weights_per_line)])
-    n = len(values_per_line)
-    def rate(st):
-        st = np.asarray(st)
-        num, den = v[st + size] - v[st], w[st + size] - w[st]
-        return float(np.mean(num / np.maximum(den, 1)))
-    starts = [s for s in starts if s + size <= n]
-    k = len(starts)
-    obs = rate(starts)
-    rng = np.random.default_rng(seed)
-    gap = min_gap or size
-    null = np.empty(n_perm)
-    for b in range(n_perm):
-        picked, taken = [], np.zeros(n, bool)
-        for s0 in rng.permutation(n - size + 1):
-            if not taken[s0]:
-                picked.append(s0)
-                taken[max(0, s0 - gap + 1): s0 + gap] = True
-                if len(picked) == k:
-                    break
-        null[b] = rate(picked)
-    mu = null.mean()
-    return {"observed": obs, "null_mean": mu, "null_sd": null.std(), "n_windows": k,
-            "p_two_sided": (1 + np.sum(np.abs(null - mu) >= abs(obs - mu))) / (1 + n_perm),
-            "p_greater": (1 + np.sum(null >= obs)) / (1 + n_perm)}
-
-def phase_wavelet_threshold(sig, scales, wavelet="cmor1.5-1.0", smooth_sigma=(2, 2),
-                            n_surr=30, q=0.95, seed=0):
-    """
-    Second run: the AR(1) null still called 46% of Midsummer's spectrum significant.
-    AR(1) has a short memory, but a max-over-18-line-windows signal stays correlated for
-    ~18 lines, so AR(1) underestimates its long-period power.
-
-    Phase-randomized surrogates keep the signal's OWN average power spectrum and scramble
-    only the phases (Theiler et al. 1992). Anything significant against them is power that
-    is LOCALIZED in time (a burst at one place in the play), not a property of the whole
-    signal -- which is what "a sonnet-rich passage here" would look like.
-    Returns threshold per scale (95th percentile inside the cone of influence).
-    """
-    sig = np.asarray(sig, float) - np.mean(sig)
-    n = len(sig)
-    amp = np.abs(np.fft.rfft(sig))
-    rng = np.random.default_rng(seed)
-    pooled = []
-    for _ in range(n_surr):
-        ph = rng.uniform(0, 2 * np.pi, len(amp)); ph[0] = 0
-        if n % 2 == 0: ph[-1] = 0
-        x = np.fft.irfft(amp * np.exp(1j * ph), n)
-        c, _ = pywt.cwt(x, scales, wavelet, method="fft")
-        pooled.append(gaussian_filter(np.abs(c) ** 2, sigma=smooth_sigma))
-    pooled = np.stack(pooled)
-    t = np.arange(n); edge = np.minimum(t, n - 1 - t)
-    thr = np.empty(len(scales))
-    for k, sc in enumerate(scales):
-        inside = edge >= np.sqrt(2) * sc
-        vals = pooled[:, k, inside] if inside.sum() >= 10 else pooled[:, k, :]
-        thr[k] = np.quantile(vals, q)
-    return thr
-
-def show_raw(phrase, before=3, after=6):
-    """Print the RAW Gutenberg lines around a phrase, exactly as the cleaner receives them.
-    Use it when a known sonnet is 'not in the corpus' or a speaker label looks wrong."""
-    key = re.sub(r"[^a-z0-9]", "", phrase.lower())[:25]
-    raw = full_text.split("\n")
-    hits = [i for i, l in enumerate(raw) if key and key in re.sub(r"[^a-z0-9]", "", l.lower())]
-    if not hits:
-        print(f"'{phrase}' not found in the raw text"); return
-    for i in hits[:3]:
-        print(f"--- raw lines {i - before}..{i + after} ---")
-        for j in range(max(0, i - before), min(len(raw), i + after + 1)):
-            print(f"{j:7d} | {raw[j]!r}")
+import importlib
+import sonnet_toolkit as tk
+importlib.reload(tk)              # pick up edits when the cell is re-run
+from sonnet_toolkit import *
+tk.FULL_TEXT = full_text          # for show_raw()
 
 print("Shared toolkit ready:", WEIGHTS)
-
 
 # %% [markdown] id="HcUytcCionud"
 # # Part 2 - Classifier
@@ -1327,15 +310,7 @@ print(f"Extracted {len(all_positive_texts)} positive sonnets.")
 
 # 2. Clean 14-line windows from every play. play_meta line index = cleaned line index,
 #    the same index analyze_work / scan_work use, so overlays line up (bug 6).
-play_windows, play_meta = [], []
-for title, lines in works.items():
-    if title in NON_PLAY_TITLES:
-        continue
-    clean_lines = [t for t, _ in clean_play_lines(lines)[0]]
-    for i in range(0, len(clean_lines) - 14 + 1):
-        block = clean_lines[i:i + 14]
-        play_windows.append("\n".join(block))
-        play_meta.append((title, i, block[0]))
+play_windows, play_meta = build_play_windows(works, size=14)
 print(f"{len(play_windows)} clean play windows.")
 
 def make_hard_negatives(n_samples, block_len=14, random_state=42):
@@ -1687,36 +662,15 @@ print("Rule detector ready (weights from cell 4):", WEIGHTS)
 # by these numbers, on the TEST half of the known sonnets.
 # -----------------------------------------------------------------------------
 import difflib
-TOLERANCE = 3          # a hit within 3 lines of the true start counts (more for 16-18-line passages)
 EVAL_KS = (10, 25, 50, 100, 250)
 
 def locate_known_sonnets(works, specs, manual):
-    """Find each known sonnet's start line in the CLEANED lines of its play."""
-    plays = {t: clean_play_lines(l)[0] for t, l in works.items() if t not in NON_PLAY_TITLES}
+    """Find each known sonnet's start line in the CLEANED lines of its play (toolkit locate_passage)."""
     rows = []
     for spec in specs:
         label = spec["label"]
         first = manual[label][0] if label in manual else spec["first_line"]
-        key = _normalize_for_match(first)[:30]
-        hit = None
-        for title, cd in plays.items():
-            for i, (t, _) in enumerate(cd):
-                if _normalize_for_match(t).startswith(key):
-                    hit = (title, i)
-                    break
-            if hit:
-                break
-        if hit is None:
-            # Spelling differs between the edition the label came from and Gutenberg
-            # (e.g. "y-slackèd" vs "yslaked"): accept the closest line if it is >= 85% similar.
-            best = (0.0, None)
-            for title, cd in plays.items():
-                for i, (t, _) in enumerate(cd):
-                    r = difflib.SequenceMatcher(None, key, _normalize_for_match(t)[:30]).ratio()
-                    if r > best[0]:
-                        best = (r, (title, i))
-            if best[0] >= 0.85:
-                hit = best[1]
+        hit = locate_passage(works, first)
         rows.append({"label": label, "play": hit[0] if hit else None,
                      "line": hit[1] if hit else None,
                      "n_lines": len(manual[label]) if label in manual else spec["num_lines"]})
@@ -1737,25 +691,8 @@ known_df["split"] = "test"
 known_df.loc[_perm[: len(known_df) // 2], "split"] = "tune"
 print(known_df[["label", "play", "line", "split"]].to_string(index=False))
 
-def ranked_hits(score_by_play, radius=NMS_RADIUS):
-    """Pool NMS peaks from every play into one ranked list [(play, line, score)]."""
-    hits = []
-    for play, sc in score_by_play.items():
-        sc = np.asarray(sc)
-        for idx in nms_top_k(sc, k=None, radius=radius):
-            hits.append((float(sc[idx]), play, idx))
-    hits.sort(key=lambda h: -h[0])
-    return [(p, i, s) for s, p, i in hits]
-
-def known_ranks(hits, known, tol=TOLERANCE):
-    """1-based rank of the first hit matching each known sonnet (inf if never hit)."""
-    ranks = []
-    for _, row in known.iterrows():
-        slack = max(tol, int(row["n_lines"]) - 12)     # longer passages (15-18 lines) can peak a few lines in
-        r = next((k + 1 for k, (p, i, _) in enumerate(hits)
-                  if p == row["play"] and abs(i - row["line"]) <= slack), np.inf)
-        ranks.append(r)
-    return np.array(ranks, dtype=float)
+# ranked_hits() and known_ranks() live in the toolkit (version 8), shared with the
+# top-3000 recheck and the annotation export.
 
 def evaluate(score_by_play, known, name, ks=EVAL_KS):
     hits = ranked_hits(score_by_play)
@@ -1867,15 +804,15 @@ print(f"  all {len(known_df)}: recall@50 = {np.mean(rank_table['rule + PU (fused
 # gets SHORT_FORM_CREDIT (0.75) of the rhyme score. Rescan with 1.0 and compare on TEST.
 RUN_SHORT_FORM_CHECK = True     # rescans every play once (~1-2 min)
 if RUN_SHORT_FORM_CHECK:
-    _saved = SHORT_FORM_CREDIT
+    _saved = tk.SHORT_FORM_CREDIT           # the module's setting is what scan_work reads
     for credit in (0.75, 1.0):
-        SHORT_FORM_CREDIT = credit
+        tk.SHORT_FORM_CREDIT = credit
         sbp = {t: scores_from_scan(scan_work(t, works[t]))[0] for t in play_titles}
         for split in ("tune", "test"):
             row, _ = evaluate(sbp, known_df[known_df["split"] == split], f"credit {credit}")
             print(f"  SHORT_FORM_CREDIT = {credit:.2f}, {split}: recall@50 {row['recall@50']:.2f}, "
                   f"median rank {row['median_rank']:.0f}")
-    SHORT_FORM_CREDIT = _saved
+    tk.SHORT_FORM_CREDIT = _saved
     print("Change SHORT_FORM_CREDIT in cell 4 only if the TEST half improves.")
 
 # Diagnose sonnets that still cannot be located (raw Gutenberg text around the first line)
