@@ -831,3 +831,193 @@ Structural-only features, scheme-aware features (ABAB pair counts, final-couplet
 7. **Cell 9:** the new verdict should say there is no structure.
 
 Runtime: cell 8b now rescans every play twice for the short-form check (set `RUN_SHORT_FORM_CHECK = False` to skip).
+
+## Third run results
+
+The third Colab run (version 7, code identical to the `v7` tag) located **21 of the 22** known play sonnets. The 22nd, Edward III, is not in Gutenberg #100, so 21 is the ceiling. The rule detector's test-half recall@50 rose from 0.6 to **0.73**, with a median rank of **13**. The fused ranking did not beat it. Full output: [results/run-3.md](results/run-3.md).
+
+### Scoreboard
+
+The tune half has 10 sonnets and the test half has 11. Intervals are 95% bootstrap intervals over all 21 located sonnets.
+
+| Detector | Half | n | Recall@10 | Recall@50 | Recall@250 | Median rank |
+| --- | --- | --- | --- | --- | --- | --- |
+| Rule detector | tune | 10 | 0.30 | 0.60 | 0.70 | 48 |
+| Rule detector | test | 11 | 0.45 | 0.73 | 0.91 | 13 |
+| Supervised classifier | tune | 10 | 0.00 | 0.10 | 0.20 | 2,168 |
+| Supervised classifier | test | 11 | 0.00 | 0.09 | 0.27 | 445 |
+| PU classifier | tune | 10 | 0.00 | 0.10 | 0.20 | 2,163 |
+| PU classifier | test | 11 | 0.00 | 0.09 | 0.27 | 467 |
+| Rule + PU (fused) | tune | 10 | — | 0.20 | — | 151 |
+| Rule + PU (fused) | test | 11 | — | 0.64 | — | 24 |
+
+| Detector, all 21 sonnets | Recall@50 \[95% interval\] | Median rank \[95% interval\] |
+| --- | --- | --- |
+| Rule detector | 0.67 \[0.48, 0.86\] | 38 \[7, 124\] |
+| Rule + PU (fused) | 0.43 \[0.24, 0.62\] | — |
+| Supervised classifier | 0.10 \[0.00, 0.24\] | 1,054 \[409, never\] |
+| PU classifier | 0.10 \[0.00, 0.24\] | 1,280 \[394, never\] |
+
+| Version 7 check | Result |
+| --- | --- |
+| `show_raw()` | Only Edward III is unlocated; its first line is nowhere in the raw text. LLL 4.3.24 is located (line 1198, rank 10). |
+| `explain_misses()` | 7 sonnets outside the top 50. Five are suppressed by a stronger peak 1–7 lines away (LLL 4.3.57, Troilus, Pericles 10 and 21, Cymbeline). Two score too low: Much Ado (top 7.1%) and All's Well 1.1 (top 1.0%). |
+| SHORT\_FORM\_CREDIT 0.75 vs 1.0 | Test recall@50 0.73 vs 0.64, median 13 vs 14; tune 0.60 vs 0.20. **Keep 0.75.** |
+| Fused vs rule | 0.43 \[0.24, 0.62\] vs 0.67 \[0.48, 0.86\] over all 21; test 0.64 vs 0.73. **Not adopted.** |
+| Friar Laurence, TF-IDF off | Supervised 0.046 (run 2: 0.69); PU 0.013. Fixed. |
+| Wavelet, phase-randomized | 6.3% significant (about 5% by chance), vs AR(1) 45.5% and white noise 66.5%. No localized bursts. |
+| Clustering verdict | "No stable rare-word cluster structure." Highest silhouette 0.003; best ARI 0.36. |
+| Distinctness validation | Passed again: semantic p = 0.0098, style p = 8 × 10⁻⁵. |
+| Coherence validation | Failed again: p = 0.078. |
+| Rare words, Midsummer | Window permutation p = 0.87, 0.50, 0.24. No difference. |
+| Tuned weights | meter 0 / syllable 0.1 / rhyme 0.1 / couplet 0.8; test unchanged (0.73 → 0.73). Documented weights kept. |
+
+### The professor's three questions
+
+| Question | Evidence | Answer |
+| --- | --- | --- |
+| (1) Does the code mishandle line indexing and stage directions? | No cleaned line in 38 plays contains `[` or `]`. All 21 locatable sonnets are found at their first line. Window *i* is the same text in the scan, the classifier windows and the evaluation (tests/test_cleaner.py, 8 tests pass). The raw text did show one bug: speaker tags printed without a period (`PROLOGUE`, `FORD`) were dropped, so **435 lines in 38 plays had the wrong speaker**, including Midsummer's Prologue as THESEUS. | Indexing is correct and tested. Speaker labels were wrong in places; fixed in version 8. Scores never used speakers, so recall did not change. |
+| (2) An LLM check of the top 3000 windows found 0 sonnets | The top 3000 rule windows are **489 distinct passages** (6.1 windows each), and **19 of the 21** known sonnets overlap them: R&J 1.5 is window 1, Comedy of Errors window 2 ([results/top3000-recheck.md](results/top3000-recheck.md)). | The check missed sonnets that were in its list, so its zero says nothing about the plays. It may also have read the classifier export, which ranks known sonnets poorly. |
+| (3) Maybe the plays contain few sonnets | Not testable from scores. The 100 best distinct passages plus the known sonnets are in a blind annotation sheet (`annotation/`). The professor's two Midsummer sonnets go into `DISCOVERED_SONNETS`, which is reported but never tuned on. | Open until humans label the sheet. |
+
+## Walkthrough (version 7)
+
+Version 7 has 46 cells, the same layout as version 6.
+
+| Cell | Part | What it does | Third-run output |
+| --- | --- | --- | --- |
+| 1–3 | Setup, 1 Intro | Installs, download, parsing | 5,359,397 characters; 45 works |
+| 4 Shared toolkit | 1 Intro | Slant rhymes at 0.45; reduced-vowel weak rhymes; `show_raw()`; 4-line rule for unclosed \[ | Weights 25/15/35/25 |
+| 5–6 | 2 Classifier | Structural features; supervised and PU models; TF-IDF off | AUC 0.974 (0.981 with TF-IDF, not used); PU c = 0.405 |
+| 7 | 2 Classifier | Scores every clean window; top-2% exports | 107,205 windows; 2,145 per list; 1,952 overlap |
+| 8 | 3 Hunter | Rule detector wrapper | — |
+| 8b Evaluation | 3 Hunter | Locate, recall@k, intervals, miss diagnosis, fused ranking, short-form check, tuning | 21 of 22 located; rule test recall@50 0.73 |
+| 9 | 3 Hunter | THE SONNETS scan, scheme labels, vocabulary, clustering | Verdict: no structure; Sonnet 30 no longer ABBA |
+| 10 | 3 Hunter | Midsummer: signal, wavelet (three nulls), rare words | Puck 0.89; phase-randomized 6.3%; permutation p ≥ 0.24 |
+| Temporal analysis, Combined PCA | 3 Hunter | Dates, LSA themes, PCA | Ran |
+| 11 | 3 Hunter | Batch scan of all works | 45 works in 6 batches |
+| 12, word-usage chart | 3 Hunter | Popularity table; rare-word fractions | Ran |
+| Sonnet Finder V2 | 4 Distinctness | Neural G2P mode | R&J 1.5 0.97, Act 2 Chorus 0.96, Prologue 0.90 |
+| Embedding setup, coherence, stylometry, distinctness | 4 Distinctness | Validation first | Coherence p = 0.078 (fails); distinctness p = 0.0098 (passes) |
+
+## What works well (version 7)
+
+- **21 of 22 known sonnets are located,** which is every one the corpus contains. LLL 4.3.24 now ranks 10th.
+- **The rule detector improved on the test half,** from recall@50 0.6 to 0.73 and median rank 40 to 13. The gain came from cleaner and rhyme fixes, not from tuning on the test sonnets.
+- **The miss diagnosis splits the misses cleanly:** five are NMS suppression, two are low scores. They need different fixes.
+- **Every comparison was settled on the test half:** SHORT\_FORM\_CREDIT stays at 0.75, the fused ranking is not adopted, and tuned weights are not adopted.
+- **The phase-randomized null behaves as a null should** (6.3% vs about 5% expected). So Midsummer's wavelet shows no localized burst.
+- **The verdicts now say what the numbers say:** no cluster structure, no rare-word difference, no coherence signal.
+
+## Bugs found in the third run
+
+| # | Cell | Bug | Effect | Fix |
+| --- | --- | --- | --- | --- |
+| 1 | 4 | Speaker tags that Gutenberg prints without a period (`PROLOGUE`, `FORD`, `SNOUT`, `PERICLES`) failed the speaker test and were dropped as all-caps titles | 435 lines in 38 plays credited to the previous speaker; Midsummer's Prologue sonnet labelled \[THESEUS\] | A bare tag counts if the same play also uses the name with a period, or it is PROLOGUE/EPILOGUE/CHORUS (the play's title line is excluded) |
+| 2 | 3 | The Comedy of Errors entry in `manual_play_sonnets` contains the speaker tag `"LUCIANA."` as one of its 15 lines | Cell 9 and the validation cells score a speaker tag as verse; the evaluation is unaffected (its tolerance is 3 either way) | **Not fixed:** it changes the known-sonnet data, so it is left for the owner to decide |
+| 3 | 9 | THE SONNETS' top segments print \[UNKNOWN\] as the speaker | Cosmetic | Not fixed |
+
+## Method improvements (round 4)
+
+### 1. Make the cleaner testable
+
+The professor's first question can't be answered by reading one run's output. Cell 4 now imports its code from `src/sonnet_toolkit.py`, and `tests/test_cleaner.py` checks the cleaner and the window indexing on the real corpus.
+
+### 2. Count distinct passages, not windows
+
+Any list of top windows repeats each passage about 6 times. Reviews, LLM checks and annotation should all work on NMS-distinct passages.
+
+### 3. Let humans decide what is a sonnet
+
+The detector ranks; it can't settle question (3). A blind sheet with known sonnets mixed in measures annotator accuracy and detector precision at the same time. Settle the definitions in `annotation/RUBRIC.md` before anyone labels.
+
+### 4. Keep later discoveries out of tuning
+
+Sonnets found after the detector was built (the professor's, or annotators') are the fairest test the project has. They live in `DISCOVERED_SONNETS` and are only reported.
+
+### 5. Fix NMS suppression next
+
+Five of the seven misses are suppressed by a peak 1–7 lines away. Two fixes to compare on the test half: report the suppressed sonnet's own window when it scores within a small margin of the peak, or snap a peak to the nearest speech or scene boundary.
+
+### 6. Short meters need their own score
+
+Much Ado (tetrameter-like) and Pericles 10 (octosyllabic) score low because the meter template is pentameter. A tetrameter template, scored as the better of the two, would test whether these are reachable.
+
+### 7. Drop or rebuild the classifiers
+
+They reach recall@50 0.10, and fusing them with the rule ranking made it worse. Either redesign them (round-2 improvement 8) or stop reporting them as detectors.
+
+## Suggested order of work (round 4)
+
+1. Settle the rubric and have at least two people label `annotation/top_candidates.csv` blind.
+2. Add the professor's two Midsummer sonnets to `DISCOVERED_SONNETS` and read their ranks.
+3. Push the `v8` tag, so Colab can clone the toolkit, and run version 8.
+4. Score the annotation: annotator accuracy on known sonnets, agreement (kappa), and precision by rank band with intervals.
+5. Then try the NMS and short-meter changes, judged on the test half and the discovered sonnets.
+
+## Changes made in version 8
+
+Version 8 fixes bug 1 and implements improvements 1–4. It also adds two scripts, a blind annotation sheet and a results page. Bugs 2–3 and improvements 5–7 are left open. Unlike earlier rounds, the cleaner and the rule evaluation were run on the **real** Gutenberg text, locally (no Colab, no BERT cells): `pytest tests/` passes 8 of 8, and the rule ranks match run 3 (test recall@50 0.73, median 13).
+
+### 1. Speaker tags without a period (bug 1)
+
+**Before.** A speaker tag had to end in a period (`THESEUS.`). `PROLOGUE.` and `EPILOGUE.` had a special case, but bare `PROLOGUE` did not.
+
+**Problem.** The raw text at Midsummer 5.1 reads `PROLOGUE` with no period. That line was dropped as a title, so the speech went to THESEUS. The same typo affects 435 lines across 38 plays.
+
+**Now.** A bare all-caps line is a speaker tag if the same play also uses that name with a period, or it is PROLOGUE, EPILOGUE or CHORUS. Line 0 (the play's title) is excluded. Cleaned text and line indices are identical to version 7 on every play.
+
+**Why it matters for the hunter.** Single- versus shared-speaker is part of the sonnet definition, and the annotation sheet shows speakers. Both need the right names.
+
+### 2. The toolkit moves to `src/` with tests (improvement 1)
+
+**Before.** The shared toolkit was cell 4's code, so it could only be checked by running the notebook.
+
+**Problem.** "The code may struggle with line indexing" can only be answered by tests that run on the real text.
+
+**Now.** `src/sonnet_toolkit.py` holds everything that was in cell 4. It also holds `parse_works` and `strip_gutenberg` (from cells 2–3), `locate_passage`, `ranked_hits` and `known_ranks` (from 8b), and a single `build_play_windows` (from cell 6). The 22 known sonnets move to `src/known_sonnets.py`. Cell 1 uses the local `src/`, or in Colab clones the repo at `TOOLKIT_REF = "v8"`. Cell 4 runs `from sonnet_toolkit import *`. The 8b short-form check now sets `tk.SHORT_FORM_CREDIT`, because assigning the imported name would not reach the module. `tests/test_cleaner.py` checks:
+- every locatable known sonnet is found;
+- R&J 1.5 starts at "If I profane";
+- no cleaned line contains a bracket;
+- the Prologue speaks Midsummer's Prologue;
+- window *i* is the same text in `scan_work`, the classifier windows and the evaluation.
+
+**Why it matters for the hunter.** A regression in the cleaner now fails a test instead of silently hiding sonnets, which is what happened in run 1.
+
+### 3. Top-3000 recheck (improvement 2)
+
+**Before.** The only evidence about the top 3000 windows was an LLM pass that found no sonnets.
+
+**Problem.** 3000 overlapping windows are about 489 passages, and nobody had checked whether known sonnets were among them.
+
+**Now.** `scripts/top3000_recheck.py` writes [results/top3000-recheck.md](results/top3000-recheck.md): 489 distinct passages, and 19 of 21 known sonnets overlapping them.
+
+**Why it matters for the hunter.** The "zero sonnets" result is shown to be a failure of the check, not evidence about the plays.
+
+### 4. Blind annotation sheet (improvement 3)
+
+**Before.** Candidates were judged by eye or by an LLM, with scores visible.
+
+**Problem.** Neither gives a measured precision or an annotator error rate.
+
+**Now.** `scripts/export_annotation.py` writes `annotation/top_candidates.csv`: the top 100 distinct rule passages plus the 6 known sonnets not among them, 106 items, shuffled, with speakers and act/scene and no scores. `annotation/key.csv` holds the ranks, scores and known-sonnet flags. `annotation/RUBRIC.md` is a draft definition for you to edit. The fused ranking is left out because run 3 showed it was no better.
+
+**Why it matters for the hunter.** Precision of the top 100 becomes a number with an interval, and annotator accuracy on the 21 known sonnets shows how much to trust it.
+
+### 5. Discovered sonnets (improvement 4)
+
+**Before.** Any new sonnet would have had to join the 22 known ones, and with them the tune/test split.
+
+**Problem.** A sonnet found after the detector was built is an independent test only if nothing is tuned on it.
+
+**Now.** `DISCOVERED_SONNETS` in `src/known_sonnets.py` (empty for now). Cell 8b's `report_discovered()` prints rule and fused ranks and a miss diagnosis for each entry.
+
+**Why it matters for the hunter.** The professor's Midsummer sonnets will test the detector without contaminating the evaluation.
+
+### What to check on the next run
+
+1. **Before running:** push the `v8` tag (`git push origin round-4 v8`). Cell 1 clones it in Colab and prints "Toolkit from: …".
+2. **Cell 10 top hits:** the "If we offend" window is shown as \[PROLOGUE\], not \[THESEUS\].
+3. **Cell 8b:** the numbers should match run 3 (21 located; rule test recall@50 0.73, median 13). Speaker labels don't enter the score.
+4. **Cell 8b, discovered sonnets:** once entries are added, their rule and fused ranks.
+5. **Cell 7:** the classifier window count should still be 107,205.

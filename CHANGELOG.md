@@ -1,5 +1,23 @@
 # Changelog
 
+## v8 — answering the review: tested cleaner, top-3000 recheck, blind annotation
+
+Why: the professor asked whether line indexing and stage directions are handled, why an LLM
+pass over the top 3000 windows found no sonnets, and whether the plays simply hold few.
+Run 3 (v7) located 21 of 22 known sonnets (Edward III is not in Gutenberg #100); rule test
+recall@50 0.73, median rank 13. The fused ranking was worse (0.43 vs 0.67 over all 21).
+
+- Cleaner: speaker tags printed without a period (PROLOGUE, FORD, SNOUT...) are kept;
+  435 lines had the wrong speaker, including Midsummer's Prologue as THESEUS. Text and indices unchanged.
+- Toolkit moved to `src/sonnet_toolkit.py` (plus parse_works, locate_passage, ranked_hits,
+  build_play_windows); known sonnets in `src/known_sonnets.py`; cell 1 clones the repo in Colab.
+- `tests/test_cleaner.py`: known sonnets found, R&J 1.5 start, no brackets, Prologue speaker,
+  one window index everywhere.
+- Top-3000 recheck: 489 distinct passages; 19 of 21 known sonnets inside (`docs/results/top3000-recheck.md`).
+- Blind annotation sheet: top 100 rule passages + known sonnets, shuffled, no scores; draft rubric.
+- `DISCOVERED_SONNETS` (reported by `report_discovered()`, never tuned on).
+- Run 3 recorded in `docs/results/run-3.md` with every figure.
+
 ## v7 — fixes from the second run
 
 Why: the second run showed TF-IDF returning by an AUC-based switch (Friar Laurence 0.06 -> 0.69),
